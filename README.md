@@ -53,8 +53,8 @@
 
 1. Fork 或推送本目录到自己的 GitHub 仓库。
 2. Cloudflare 控制台 → `Workers & Pages` → `Create application` → `Import a repository`，选中该仓库。
-3. 构建配置：Build command 留空，Deploy command 填 `npm run deploy`，Node.js 版本 22。
-4. 需要为 Builds 配一个 Cloudflare API Token，权限包含 `Workers Scripts: Edit`、`D1: Edit` 和账号读取。
+3. 构建配置：Build command 留空，Deploy command 改成 `npm run deploy`（默认的 `npx wrangler deploy` 会跳过建库、迁移和设置码，见「常见问题」），Node.js 版本 22。
+4. Build 用的 API Token 要带 `Account → D1 → Edit`：Workers Builds 自动生成的 Token 只有 Workers Scripts / KV / R2 / Zone 权限，不含 D1，到 `My Profile → API Tokens` 编辑它补上，或在 Build 设置里换成自己的 Token。
 5. 保存并部署。首次部署会自动创建 D1 数据库、写入 `database_id`、应用迁移，并在日志里打印「首次设置码」。
 6. 打开 Worker 地址，输入设置码，创建管理员账号。之后所有部署都会保留账号和数据。
 
@@ -149,6 +149,8 @@ npm test        # 跑计分规则单元测试（Node 内置测试运行器，不
 ## 常见问题
 
 **部署后打开显示「还没初始化」**：数据库没有用户，也没读到 `SETUP_TOKEN`。重新跑一次 `npm run deploy`，或用 `npx wrangler secret put SETUP_TOKEN` 手动设置后再部署。
+
+**部署日志报 `D1 binding 'DB' references database '00000000-0000-0000-0000-000000000000' which was not found`**：Deploy command 还是默认的 `npx wrangler deploy`，直接把 `wrangler.jsonc` 里的占位 ID 拿去部署了。建库、回写 ID、应用迁移、签发设置码都在 `scripts/deploy.mjs` 里，把 `Worker → Settings → Build → Deploy command` 改成 `npm run deploy` 再重试即可。改完如果卡在 `wrangler d1 list`，就是 Token 缺 `D1: Edit`。
 
 **设置码失效了**：数据库中已有用户，初始化入口按设计关闭。忘记管理员密码时，用管理员账号在「设置 → 用户」里改，或在 Cloudflare 控制台直接改 D1。
 

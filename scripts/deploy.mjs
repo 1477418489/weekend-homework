@@ -140,8 +140,15 @@ async function main() {
   const run = createWranglerRunner(root, configPath);
   const saveConfig = (value) => writeFile(configPath, `${JSON.stringify(value, null, 2)}\n`);
 
-  await bindDatabase(binding, run, saveConfig, config);
-  await run(["d1", "migrations", "apply", "DB", "--remote"]);
+  try {
+    await bindDatabase(binding, run, saveConfig, config);
+    await run(["d1", "migrations", "apply", "DB", "--remote"]);
+  } catch (error) {
+    const hint = /auth|permission|10000|9109|403/i.test(error.message)
+      ? "\n提示：D1 操作需要 API Token 带 Account → D1 → Edit 权限，Workers Builds 自动生成的 Token 默认没有。"
+      : "";
+    throw new Error(`${error.message}${hint}`);
+  }
 
   const total = await countUsers(run);
   await run(["deploy", "--var", `APP_VERSION:${packageJson.version}`]);

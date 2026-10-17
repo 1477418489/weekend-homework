@@ -31,6 +31,16 @@ export function weekKeyOf(ms = Date.now()) {
   return local.toISOString().slice(0, 10);
 }
 
+export function canonicalWeekKey(value) {
+  if (!isWeekKey(value)) return null;
+  const ms = weekStartMs(value);
+  if (!Number.isFinite(ms)) return null;
+  const local = new Date(ms + TZ_OFFSET_MS);
+  const offset = (local.getUTCDay() + 2) % 7;
+  local.setUTCDate(local.getUTCDate() - (offset <= 3 ? offset : offset - 7));
+  return local.toISOString().slice(0, 10);
+}
+
 export function weekStartMs(weekKey) {
   return Date.parse(`${weekKey}T00:00:00.000+08:00`);
 }

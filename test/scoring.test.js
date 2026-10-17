@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  canonicalWeekKey,
   computeAutoScore,
   normalizeDetail,
   scoreFromRate,
@@ -27,6 +28,18 @@ test("shiftWeek 跨月正确", () => {
   assert.equal(shiftWeek("2026-10-16", 1), "2026-10-23");
   assert.equal(shiftWeek("2026-10-16", -1), "2026-10-09");
   assert.equal(shiftWeek("2026-02-27", 1), "2026-03-06");
+});
+
+test("canonicalWeekKey 把非周五的周键归一到所在周的周五", () => {
+  assert.equal(canonicalWeekKey("2026-10-16"), "2026-10-16");
+  assert.equal(canonicalWeekKey("2026-10-22"), "2026-10-23");
+  assert.equal(canonicalWeekKey("2026-10-08"), "2026-10-09");
+  assert.equal(canonicalWeekKey("2026-10-23"), "2026-10-23");
+  assert.equal(canonicalWeekKey("2026-10-19"), "2026-10-16");
+  assert.equal(canonicalWeekKey("2026-10-17"), "2026-10-16");
+  assert.equal(canonicalWeekKey("2026-10-18"), "2026-10-16");
+  assert.equal(canonicalWeekKey("not-a-date"), null);
+  assert.equal(canonicalWeekKey("2026-13-01"), null);
 });
 
 test("weekDeadlines 对应周五 21:00 与周六三档", () => {

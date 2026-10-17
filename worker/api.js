@@ -17,9 +17,9 @@ import {
   SCORE_LABEL,
   SCORE_MAX,
   WEEK_HINT,
+  canonicalWeekKey,
   completionRate,
   computeAutoScore,
-  isWeekKey,
   normalizeDetail,
   totalOf,
   weekKeyOf,
@@ -35,8 +35,7 @@ function route(method, pattern, minRole, handler) {
 }
 
 function pickWeek(url) {
-  const value = url.searchParams.get("week");
-  return isWeekKey(value) ? value : weekKeyOf();
+  return canonicalWeekKey(url.searchParams.get("week")) || weekKeyOf();
 }
 
 function cookieOptions(request) {
@@ -240,7 +239,7 @@ route("POST", /^\/api\/tasks$/, "student", async ({ env, user, request }) => {
   const parsed = await readJson(request);
   if (parsed.response) return parsed.response;
   const body = parsed.body;
-  const weekKey = isWeekKey(body.weekKey) ? body.weekKey : weekKeyOf();
+  const weekKey = canonicalWeekKey(body.weekKey) || weekKeyOf();
   const title = text(body.title, 120);
   if (!title) return fail("invalid_title", 400);
   const [next, existing] = await Promise.all([
@@ -384,7 +383,7 @@ route("POST", /^\/api\/tasks\/(\d+)\/reopen$/, "parent", async ({ env, params })
 route("POST", /^\/api\/tasks\/confirm-done$/, "parent", async ({ env, user, request }) => {
   const parsed = await readJson(request);
   if (parsed.response) return parsed.response;
-  const weekKey = isWeekKey(parsed.body.weekKey) ? parsed.body.weekKey : weekKeyOf();
+  const weekKey = canonicalWeekKey(parsed.body.weekKey) || weekKeyOf();
   await env.DB.prepare("UPDATE tasks SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? WHERE week_key = ? AND status = 'done'")
     .bind(user.id, nowIso(), weekKey)
     .run();
@@ -470,7 +469,7 @@ route("POST", /^\/api\/bonus$/, "parent", async ({ env, user, request }) => {
   const parsed = await readJson(request);
   if (parsed.response) return parsed.response;
   const body = parsed.body;
-  const weekKey = isWeekKey(body.weekKey) ? body.weekKey : weekKeyOf();
+  const weekKey = canonicalWeekKey(body.weekKey) || weekKeyOf();
   const kind = body.kind === "deduction" ? "deduction" : "bonus";
   const title = text(body.title, 120);
   const points = integer(body.points, { min: 0, max: 100, fallback: null });
@@ -493,7 +492,7 @@ route("POST", /^\/api\/settle$/, "parent", async ({ env, user, request }) => {
   const parsed = await readJson(request);
   if (parsed.response) return parsed.response;
   const body = parsed.body;
-  const weekKey = isWeekKey(body.weekKey) ? body.weekKey : weekKeyOf();
+  const weekKey = canonicalWeekKey(body.weekKey) || weekKeyOf();
   const data = await loadWeek(env, weekKey);
   const rates = await previousRates(env.DB, weekKey);
   const auto = computeAutoScore({ weekKey, tasks: data.tasks, bonusItems: data.bonusItems, prevRates: rates });
@@ -546,7 +545,7 @@ route("POST", /^\/api\/redemptions$/, "student", async ({ env, user, request }) 
   const parsed = await readJson(request);
   if (parsed.response) return parsed.response;
   const body = parsed.body;
-  const weekKey = isWeekKey(body.weekKey) ? body.weekKey : weekKeyOf();
+  const weekKey = canonicalWeekKey(body.weekKey) || weekKeyOf();
   const title = text(body.title, 120);
   const points = integer(body.points, { min: 1, max: 9999, fallback: null });
   if (!title || points === null) return fail("invalid_item", 400);

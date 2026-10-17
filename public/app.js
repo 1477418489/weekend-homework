@@ -197,7 +197,8 @@ function timeSummary() {
 
 function shiftWeekKey(weekKey, delta) {
   const start = Date.parse(`${weekKey}T00:00:00.000+08:00`);
-  return new Date(start + delta * 7 * 24 * 3600 * 1000).toISOString().slice(0, 10).replace(/T.*/, "");
+  const shifted = new Date(start + delta * 7 * 24 * 3600 * 1000 + 8 * 3600 * 1000);
+  return Number.isNaN(shifted.getTime()) ? weekKey : shifted.toISOString().slice(0, 10);
 }
 
 async function loadSession() {

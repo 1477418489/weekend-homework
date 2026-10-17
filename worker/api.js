@@ -28,6 +28,7 @@ import {
 import { bool, constantTimeEqual, fail, integer, json, nowIso, optionalText, readJson, text } from "./util.js";
 
 const ROUTES = [];
+const SETTLE_RATE_KEY = "settle_rate";
 
 function route(method, pattern, minRole, handler) {
   ROUTES.push({ method, pattern, minRole, handler });
@@ -138,9 +139,15 @@ async function accountOf(db) {
   return { earned: earnedTotal, spent: spentTotal, pending: Number(pending?.total) || 0, balance: earnedTotal - spentTotal };
 }
 
+async function readSettleRate(db) {
+  const row = await db.prepare("SELECT value FROM settings WHERE key = ?").bind(SETTLE_RATE_KEY).first();
+  const rate = Number(row?.value);
+  return Number.isFinite(rate) && rate > 0 ? Math.min(rate, 100) : 0;
+}
+
 async function weekPayload(env, weekKey) {
   const data = await loadWeek(env, weekKey);
-  const rates = await previousRates(env.DB, weekKey);
+  const [rates, rate] = await Promise.all([previousRates(env.DB, weekKey), readSettleRate(env.DB)]);
   const auto = computeAutoScore({ weekKey, tasks: data.tasks, bonusItems: data.bonusItems, prevRates: rates });
   const confirmed = data.tasks.filter((task) => task.status === "confirmed").length;
   return {
@@ -148,12 +155,13 @@ async function weekPayload(env, weekKey) {
     label: weekLabel(weekKey),
     isCurrent: weekKey === weekKeyOf(),
     hint: WEEK_HINT,
+    rate,
     scoreKeys: SCORE_KEYS.map((key) => ({ key, label: SCORE_LABEL[key], max: SCORE_MAX[key] })),
     tasks: data.tasks.map(mapTask),
     bonusItems: data.bonusItems.map(mapBonus),
     redemptions: data.redemptions.map(mapRedemption),
     score: data.score
-      ? { detail: JSON.parse(data.score.detail), total: data.score.total, settledAt: data.score.settled_at, note: data.score.note }
+      ? { detail: JSON.parse(data.score.detail), total: data.score.total, settledAt: data.score.settled_at, note: data.score.note, rate: data.score.settle_rate ?? null }
       : null,
     auto,
     summary: {
@@ -218,10 +226,11 @@ route("GET", /^\/api\/week$/, "student", async ({ env, url }) => {
 });
 
 route("GET", /^\/api\/account$/, "student", async ({ env }) => {
-  const rows = await env.DB.prepare("SELECT week_key, total, settled_at FROM week_scores ORDER BY week_key DESC LIMIT 12").all();
+  const rows = await env.DB.prepare("SELECT week_key, total, settled_at, settle_rate FROM week_scores ORDER BY week_key DESC LIMIT 12").all();
   return json({
     account: await accountOf(env.DB),
-    weeks: rows.results.map((row) => ({ weekKey: row.week_key, total: row.total, settledAt: row.settled_at }))
+    rate: await readSettleRate(env.DB),
+    weeks: rows.results.map((row) => ({ weekKey: row.week_key, total: row.total, settledAt: row.settled_at, rate: row.settle_rate ?? null }))
   });
 });
 
@@ -467,12 +476,13 @@ route("POST", /^\/api\/settle$/, "parent", async ({ env, user, request }) => {
   const detail = normalizeDetail(body.detail, auto);
   detail.auto = auto.auto;
   const total = totalOf(detail);
+  const rate = await readSettleRate(env.DB);
   await env.DB.prepare(
-    `INSERT INTO week_scores (week_key, detail, total, settled_by, settled_at, note) VALUES (?, ?, ?, ?, ?, ?)
+    `INSERT INTO week_scores (week_key, detail, total, settled_by, settled_at, note, settle_rate) VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(week_key) DO UPDATE SET detail = excluded.detail, total = excluded.total, settled_by = excluded.settled_by,
-       settled_at = excluded.settled_at, note = excluded.note`
+       settled_at = excluded.settled_at, note = excluded.note, settle_rate = excluded.settle_rate`
   )
-    .bind(weekKey, JSON.stringify(detail), total, user.id, nowIso(), optionalText(body.note, 300))
+    .bind(weekKey, JSON.stringify(detail), total, user.id, nowIso(), optionalText(body.note, 300), rate)
     .run();
   return json({ ok: true, total, detail, week: await weekPayload(env, weekKey) });
 });
@@ -481,6 +491,21 @@ route("DELETE", /^\/api\/settle$/, "admin", async ({ env, url }) => {
   const weekKey = pickWeek(url);
   await env.DB.prepare("DELETE FROM week_scores WHERE week_key = ?").bind(weekKey).run();
   return json({ ok: true, week: await weekPayload(env, weekKey) });
+});
+
+route("PUT", /^\/api\/rate$/, "parent", async ({ env, request }) => {
+  const parsed = await readJson(request);
+  if (parsed.response) return parsed.response;
+  const rate = Number(parsed.body.rate);
+  if (!Number.isFinite(rate) || rate < 0 || rate > 100) return fail("invalid_rate", 400);
+  const value = String(Math.round(rate * 10000) / 10000);
+  await env.DB.prepare(
+    `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  )
+    .bind(SETTLE_RATE_KEY, value, nowIso())
+    .run();
+  return json({ ok: true, rate: Number(value) });
 });
 
 route("GET", /^\/api\/redemptions$/, "student", async ({ env, url }) => {

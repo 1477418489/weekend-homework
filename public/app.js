@@ -6,6 +6,8 @@ const state = {
   week: null,
   options: [],
   account: null,
+  rate: 0,
+  loadedAt: "",
   settings: null,
   users: [],
   tab: "tasks",
@@ -34,6 +36,7 @@ const ERROR_TEXT = {
   invalid_url: "地址必须以 http:// 或 https:// 开头",
   setup_disabled: "服务端未配置 SETUP_TOKEN，无法初始化",
   database_not_configured: "数据库未绑定",
+  invalid_rate: "折现比例要在 0–100 之间",
   server_error: "服务端出错，稍后重试"
 };
 
@@ -95,6 +98,25 @@ function fmtMinutes(total) {
   return minutes ? `${hours} 小时 ${minutes} 分` : `${hours} 小时`;
 }
 
+function fmtMoney(points, rate) {
+  const value = (Number(points) || 0) * (Number(rate) || 0);
+  if (!value) return "";
+  return `¥${value.toFixed(2).replace(/\.?0+$/, "")}`;
+}
+
+function moneyOf(points, rate) {
+  const amount = fmtMoney(points, rate === null || rate === undefined ? state.rate : rate);
+  return amount ? ` ≈ ${amount}` : "";
+}
+
+function fmtClock(iso) {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
 function totalMinutes(key) {
   return state.week.tasks.reduce((sum, task) => sum + (Number(task[key]) || 0), 0);
 }
@@ -129,6 +151,8 @@ async function loadSession() {
 async function loadWeek(weekKey = state.weekKey) {
   state.week = await api(`/api/week?week=${encodeURIComponent(weekKey)}`);
   state.weekKey = state.week.weekKey;
+  state.rate = Number(state.week.rate) || 0;
+  state.loadedAt = new Date().toISOString();
 }
 
 async function loadOptions() {
@@ -210,8 +234,10 @@ function render() {
         <h1>周末作业打卡</h1>
         <div class="who">
           ${esc(state.user.displayName)} · ${ROLE_TEXT[state.user.role]}<br />
+          <button class="link small" data-act="refresh">刷新</button>
           <button class="link small" data-act="logout">退出</button>
           <span class="small">v${esc(state.version)}</span>
+          ${state.loadedAt ? `<br /><span class="small muted">更新于 ${fmtClock(state.loadedAt)}</span>` : ""}
         </div>
       </div>
       <nav class="tabs">
@@ -253,7 +279,7 @@ function weekBar() {
       <div style="text-align:center">
         <strong>${esc(state.week.label)}</strong>
         ${state.week.isCurrent ? '<span class="tag">本周</span>' : ""}
-        ${state.week.score ? `<div class="small muted">已结算 ${state.week.score.total} 分 · ${fmtTime(state.week.score.settledAt)}</div>` : ""}
+        ${state.week.score ? `<div class="small muted">已结算 ${state.week.score.total} 分${moneyOf(state.week.score.total, state.week.score.rate)} · ${fmtTime(state.week.score.settledAt)}</div>` : ""}
       </div>
       <div class="row between" style="margin-top:8px">
         <button class="tiny" data-act="week" data-delta="-1">← 上一周</button>
@@ -465,7 +491,11 @@ function renderSettle() {
       </div>
       <label class="field" style="margin-top:12px"><span>结算备注</span>
         <input id="settle-note" maxlength="300" value="${esc(state.week.score?.note || "")}" placeholder="例如：这周数学卡在函数，下周补" /></label>
-      <div class="total-line"><span>本周总分</span><span id="settle-total" class="mono">${settled ? state.week.score.total : detailTotal(detail)}</span></div>
+      <div class="total-line"><span>本周总分</span><span><span id="settle-total" class="mono">${settled ? state.week.score.total : detailTotal(detail)}</span><span id="settle-money" class="mono muted">${moneyOf(settled ? state.week.score.total : detailTotal(detail), settled ? state.week.score.rate ?? null : state.rate)}</span></span></div>
+      <div class="row between small muted" style="margin-top:8px">
+        <span>折现比例：1 积分 = <input id="rate-input" type="number" min="0" max="100" step="0.05" value="${state.rate}" style="width:72px" /> 元（0 = 不折现）</span>
+        <button class="tiny" data-act="rate-save">保存比例</button>
+      </div>
       ${timeSummary() ? `<div class="small muted" style="margin-top:8px">${timeSummary()}</div>` : ""}
       <div class="actions">
         <button class="primary" data-act="settle-save">${settled ? "重新结算" : "确认结算"}</button>
@@ -502,16 +532,17 @@ function renderSettle() {
 function renderAccount() {
   const account = state.account?.account || state.week.account;
   const weeks = state.account?.weeks || [];
+  const balanceMoney = fmtMoney(account.balance, state.account?.rate ?? state.rate);
   return `
     <div class="card row between">
-      <div><div class="num mono" style="font-size:22px">${account.balance}</div><div class="small muted">可用积分</div></div>
+      <div><div class="num mono" style="font-size:22px">${account.balance}</div><div class="small muted">可用积分</div>${balanceMoney ? `<div class="small muted">≈ ${balanceMoney}</div>` : ""}</div>
       <div class="small muted" style="text-align:right">累计得分 ${account.earned}<br />已兑换 ${account.spent} · 待审批 ${account.pending}</div>
     </div>
     <h2>每周结算记录</h2>
     <table>
       <thead><tr><th>周</th><th>得分</th><th>结算时间</th></tr></thead>
       <tbody>
-        ${weeks.map((row) => `<tr><td>${esc(row.weekKey)}</td><td class="mono">${row.total}</td><td class="small muted">${fmtTime(row.settledAt)}</td></tr>`).join("") || '<tr><td colspan="3" class="muted">还没有结算记录</td></tr>'}
+        ${weeks.map((row) => `<tr><td>${esc(row.weekKey)}</td><td class="mono">${row.total}${moneyOf(row.total, row.rate)}</td><td class="small muted">${fmtTime(row.settledAt)}</td></tr>`).join("") || '<tr><td colspan="3" class="muted">还没有结算记录</td></tr>'}
       </tbody>
     </table>
   `;
@@ -818,6 +849,21 @@ document.addEventListener("change", (event) => {
   }
 });
 
+document.addEventListener("input", (event) => {
+  const target = event.target;
+  if (!target.id || !target.id.startsWith("score-")) return;
+  const totalEl = document.getElementById("settle-total");
+  if (!totalEl) return;
+  const detail = {};
+  for (const item of state.week.scoreKeys) detail[item.key] = Number(document.getElementById(`score-${item.key}`).value);
+  detail.bonus = Number(document.getElementById("score-bonus").value);
+  detail.deduction = Number(document.getElementById("score-deduction").value);
+  const total = detailTotal(detail);
+  totalEl.textContent = total;
+  const moneyEl = document.getElementById("settle-money");
+  if (moneyEl) moneyEl.textContent = moneyOf(total, state.rate);
+});
+
 document.addEventListener("click", (event) => {
   const trigger = event.target.closest("[data-act]");
   if (!trigger) return;
@@ -825,6 +871,10 @@ document.addEventListener("click", (event) => {
   const id = Number(trigger.dataset.id);
 
   const actions = {
+    refresh: () => run(async () => {
+      await refreshAll();
+      setNotice("已刷新");
+    }),
     tab: () => {
       state.tab = trigger.dataset.tab;
       state.editing = null;
@@ -917,7 +967,16 @@ document.addEventListener("click", (event) => {
         const result = await api("/api/settle", { method: "POST", body: { weekKey: state.weekKey, detail, note } });
         state.week = result.week;
         state.account = await api("/api/account");
-        setNotice(`结算完成：${result.total} 分`);
+        setNotice(`结算完成：${result.total} 分${moneyOf(result.total, state.rate)}`);
+      });
+    },
+    "rate-save": () => {
+      const value = Number(document.getElementById("rate-input").value);
+      run(async () => {
+        const result = await api("/api/rate", { method: "PUT", body: { rate: value } });
+        state.rate = result.rate;
+        state.account = await api("/api/account");
+        setNotice(result.rate ? `已保存：1 积分 = ${result.rate} 元` : "已关闭折现");
       });
     },
     "settle-clear": () => {

@@ -46,6 +46,8 @@ const ROLE_TEXT = { student: "学生", parent: "家长", admin: "管理员" };
 
 const view = document.getElementById("view");
 
+let pendingButton = null;
+
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({
     "&": "&amp;",
@@ -239,6 +241,13 @@ async function run(action, successMessage) {
   if (state.busy) return;
   state.busy = true;
   state.error = "";
+  const button = pendingButton;
+  pendingButton = null;
+  if (button) {
+    button.disabled = true;
+    button.classList.add("loading");
+  }
+  document.body.classList.add("busy");
   try {
     await action();
     if (successMessage) setNotice(successMessage);
@@ -247,6 +256,7 @@ async function run(action, successMessage) {
     state.notice = "";
   } finally {
     state.busy = false;
+    document.body.classList.remove("busy");
     render();
   }
 }
@@ -774,6 +784,7 @@ document.addEventListener("submit", (event) => {
   const form = event.target.closest("form[data-form]");
   if (!form) return;
   event.preventDefault();
+  pendingButton = event.submitter || null;
   const data = Object.fromEntries(new FormData(form).entries());
   const name = form.dataset.form;
 
@@ -1114,7 +1125,10 @@ document.addEventListener("click", (event) => {
   };
 
   const handler = actions[act];
-  if (handler) handler();
+  if (handler) {
+    pendingButton = trigger;
+    handler();
+  }
 });
 
 async function boot() {

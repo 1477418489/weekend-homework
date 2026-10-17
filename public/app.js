@@ -38,6 +38,7 @@ const ERROR_TEXT = {
   setup_disabled: "服务端未配置 SETUP_TOKEN，无法初始化",
   database_not_configured: "数据库未绑定",
   invalid_rate: "折现比例要在 0–100 之间",
+  insufficient_points: "积分不够，先驳回或确认透支",
   server_error: "服务端出错，稍后重试"
 };
 
@@ -75,7 +76,12 @@ async function api(path, { method = "GET", body } = {}) {
   } catch {
     data = null;
   }
-  if (!response.ok) throw new Error(errorText(data?.error || `HTTP ${response.status}`));
+  if (!response.ok) {
+    const error = new Error(errorText(data?.error || `HTTP ${response.status}`));
+    if (data?.detail) error.detail = data.detail;
+    error.code = data?.error || "";
+    throw error;
+  }
   return data;
 }
 
@@ -187,12 +193,18 @@ function inlineMinutes(taskId) {
   return Number.isFinite(value) ? Math.max(0, Math.min(600, Math.round(value))) : null;
 }
 
+function doneBody(taskId) {
+  const actualMinutes = inlineMinutes(taskId);
+  return actualMinutes === null ? {} : { actualMinutes };
+}
+
 function timeSummary() {
   const estimate = totalMinutes("estMinutes");
   const actual = totalMinutes("actualMinutes");
   if (!estimate && !actual) return "";
   const gap = actual && estimate ? actual - estimate : 0;
-  return `<div class="small muted">用时：预估 ${fmtMinutes(estimate)} · 实际 ${fmtMinutes(actual)}${gap ? ` · 差 ${gap > 0 ? "+" : ""}${gap} 分钟` : ""}</div>`;
+  const parts = [estimate ? `预估 ${fmtMinutes(estimate)}` : "", actual ? `实际 ${fmtMinutes(actual)}` : "", gap ? `差 ${gap > 0 ? "+" : ""}${gap} 分钟` : ""].filter(Boolean);
+  return parts.length ? `<div class="small muted">用时：${parts.join(" · ")}</div>` : "";
 }
 
 function shiftWeekKey(weekKey, delta) {
@@ -270,7 +282,10 @@ function currentDetail() {
   const week = state.week;
   if (week.score) return week.score.detail;
   const detail = {};
-  for (const item of week.scoreKeys) detail[item.key] = week.auto[item.key] || 0;
+  for (const item of week.scoreKeys) {
+    const auto = week.auto[item.key] || 0;
+    detail[item.key] = item.key === "F" || item.key === "G" ? Math.max(auto, item.max) : auto;
+  }
   detail.bonus = week.auto.bonus || 0;
   detail.deduction = week.auto.deduction || 0;
   return detail;
@@ -359,16 +374,20 @@ function weekBar() {
 
 function renderTasks() {
   const summary = state.week.summary;
-  const percent = Math.round((summary.rate || 0) * 100);
+  const percent = summary.total ? Math.round(((summary.done + summary.confirmed) / summary.total) * 100) : 0;
   const detail = currentDetail();
   return `
     ${weekBar()}
     <div class="card">
-      <div class="summary">
-        <div><div class="num mono">${summary.confirmed}/${summary.total}</div><div class="small muted">已确认</div></div>
-        <div><div class="num mono">${summary.done}</div><div class="small muted">待确认</div></div>
+      <div class="stat-main">
+        <div class="num mono">${summary.done + summary.confirmed}/${summary.total}</div>
+        <div class="small muted">${summary.total ? `已搞定 · 进度 ${percent}%` : "本周一条作业都还没有"}</div>
+      </div>
+      <div class="stat-grid">
         <div><div class="num mono">${summary.pending}</div><div class="small muted">待完成</div></div>
-        <div><div class="num mono">${detailTotal(detail)}</div><div class="small muted">本周积分（暂算）</div></div>
+        <div><div class="num mono">${summary.done}</div><div class="small muted">等家长确认</div></div>
+        <div><div class="num mono">${summary.confirmed}</div><div class="small muted">已确认</div></div>
+        <div><div class="num mono">${detailTotal(detail)}</div><div class="small muted">本周得分（暂算）</div></div>
       </div>
       <div class="bar" style="margin-top:10px"><i style="width:${percent}%"></i></div>
       <div class="small muted" style="margin-top:6px">${cheerText(summary)}</div>
@@ -389,9 +408,9 @@ function taskCard(task) {
   const isParent = can("parent");
   const actions = [];
   if (task.status === "pending") {
-    actions.push(`<label class="inline-min">实际用时
+    actions.push(`<label class="inline-min"><span>实际用时（分钟）</span>
       <input id="done-min-${task.id}" type="number" min="0" max="600" inputmode="numeric"
-        value="${task.actualMinutes ?? task.estMinutes ?? ""}" placeholder="${task.estMinutes ?? 0}" /> 分钟</label>`);
+        value="${task.actualMinutes ?? task.estMinutes ?? ""}" placeholder="${task.estMinutes ?? "？"}" /></label>`);
     actions.push('<button class="primary" data-act="task-done" data-id="' + task.id + '">我完成了</button>');
     if (isParent) actions.push('<button class="ok" data-act="task-complete" data-id="' + task.id + '">直接完成并确认</button>');
   }
@@ -415,11 +434,10 @@ function taskCard(task) {
   const minutes = `预估 ${task.estMinutes ? fmtMinutes(task.estMinutes) : "未填"}${task.actualMinutes ? ` · 实际 ${fmtMinutes(task.actualMinutes)}` : ""}`;
 
   const quality = isParent && task.status !== "pending"
-    ? `<label class="field" style="margin-top:10px"><span>质量分（0–4，每科最多 4 分）</span>
-        <select data-act="task-quality" data-id="${task.id}">
-          <option value="">未评分</option>
-          ${[0, 1, 2, 3, 4].map((value) => `<option value="${value}" ${task.quality !== null && task.quality !== undefined && Number(task.quality) === value ? "selected" : ""}>${value} 分</option>`).join("")}
-        </select></label>`
+    ? `<div class="quality"><span class="small muted">质量分（每科算平均，未评按满分 4 分）</span>
+        <div class="seg">
+          ${[0, 1, 2, 3, 4].map((value) => `<span class="seg-btn" role="button" tabindex="0" data-act="task-quality" data-id="${task.id}" data-value="${value}" aria-pressed="${Number(task.quality ?? 4) === value}">${value}</span>`).join("")}
+        </div></div>`
     : "";
 
   return `
@@ -505,6 +523,7 @@ function renderRewards() {
         待审批 ${state.week.account.pending}
       </div>
     </div>
+    ${balance < 0 ? '<div class="notice info small">兑换已经批准、积分先欠着，下次结算补上就行。</div>' : ""}
     ${nudge ? `<div class="small muted" style="margin:-2px 2px 10px">${nudge}</div>` : ""}
     <h2>奖励目录</h2>
     ${rewards.map((option) => `
@@ -781,6 +800,14 @@ function renderClosed() {
   `;
 }
 
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const target = event.target.closest(".seg-btn[data-act]");
+  if (!target) return;
+  event.preventDefault();
+  target.click();
+});
+
 document.addEventListener("submit", (event) => {
   const form = event.target.closest("form[data-form]");
   if (!form) return;
@@ -908,13 +935,6 @@ document.addEventListener("submit", (event) => {
 
 document.addEventListener("change", (event) => {
   const target = event.target;
-  if (target.dataset.act === "task-quality") {
-    const id = Number(target.dataset.id);
-    run(async () => {
-      await api(`/api/tasks/${id}`, { method: "PATCH", body: { quality: target.value === "" ? null : Number(target.value) } });
-      await loadWeek();
-    });
-  }
   if (target.dataset.act === "fill-template") {
     const option = state.options.find((item) => item.id === Number(target.value));
     const form = target.closest("form");
@@ -985,12 +1005,20 @@ document.addEventListener("click", (event) => {
       state.addTask = !state.addTask;
       render();
     },
+    "task-quality": () => {
+      const value = Number(trigger.dataset.value);
+      run(async () => {
+        await api(`/api/tasks/${id}`, { method: "PATCH", body: { quality: value } });
+        await loadWeek();
+        setNotice(`质量分已记 ${value} 分`);
+      });
+    },
     "task-edit": () => {
       state.editing = state.editing === id ? null : id;
       render();
     },
     "task-done": () => run(async () => {
-      state.week = (await api(`/api/tasks/${id}/done`, { method: "POST", body: { actualMinutes: inlineMinutes(id) } })).week;
+      state.week = (await api(`/api/tasks/${id}/done`, { method: "POST", body: doneBody(id) })).week;
       const summary = state.week.summary;
       if (summary.pending) {
         setNotice(`${pickPraise()} 还剩 ${summary.pending} 条`);
@@ -1004,7 +1032,7 @@ document.addEventListener("click", (event) => {
       setNotice("已确认");
     }),
     "task-complete": () => run(async () => {
-      state.week = (await api(`/api/tasks/${id}/complete`, { method: "POST", body: { actualMinutes: inlineMinutes(id) } })).week;
+      state.week = (await api(`/api/tasks/${id}/complete`, { method: "POST", body: doneBody(id) })).week;
       setNotice("已直接完成并确认");
     }),
     "task-reopen": () => run(async () => {
@@ -1044,8 +1072,21 @@ document.addEventListener("click", (event) => {
       });
     },
     "redeem-decide": () => run(async () => {
-      state.week = (await api(`/api/redemptions/${id}/decide`, { method: "POST", body: { status: trigger.dataset.status } })).week;
-      setNotice("已处理");
+      const status = trigger.dataset.status;
+      const decide = (allowNegative) => api(`/api/redemptions/${id}/decide`, { method: "POST", body: { status, allowNegative } });
+      try {
+        state.week = (await decide(false)).week;
+        setNotice(status === "approved" ? "已批准，积分已扣" : "已驳回");
+      } catch (error) {
+        if (error.code !== "insufficient_points") throw error;
+        const missing = error.detail?.missing ?? 0;
+        const balance = error.detail?.balance ?? 0;
+        if (status !== "approved" || !confirm(`可用积分只剩 ${balance} 分，还差 ${missing} 分。确认要批准这笔兑换？积分会变成负数（先欠着）。`)) {
+          throw new Error(`积分不够：可用 ${balance} 分，还差 ${missing} 分，先驳回或者等积分到手`);
+        }
+        state.week = (await decide(true)).week;
+        setNotice("已批准（积分先欠着）");
+      }
     }),
     "settle-save": () => {
       const detail = {};

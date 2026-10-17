@@ -98,10 +98,11 @@ function qualityScore(tasks) {
   const bySubject = new Map();
   for (const task of tasks) {
     if (task.status !== "confirmed") continue;
-    if (task.quality === null || task.quality === undefined) continue;
     const subject = task.subject || "其他";
     const bucket = bySubject.get(subject) || [];
-    bucket.push(Math.min(4, Math.max(0, Number(task.quality) || 0)));
+    // 家长没单独打分的确认任务按满分算，要扣分就在卡片上把质量分改小。
+    const value = task.quality === null || task.quality === undefined ? 4 : Number(task.quality) || 0;
+    bucket.push(Math.min(4, Math.max(0, value)));
     bySubject.set(subject, bucket);
   }
   let total = 0;

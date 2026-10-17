@@ -88,6 +88,15 @@ test("computeAutoScore 统计清单分、完成分、提前分与质量分", () 
   assert.equal(auto.deduction, 0);
 });
 
+test("computeAutoScore 未打分的确认任务按质量满分算", () => {
+  const tasks = [
+    task({ status: "confirmed", subject: "英语", quality: null, done_at: "2026-10-17T02:00:00.000Z" }),
+    task({ status: "confirmed", subject: "英语", quality: 2, done_at: "2026-10-17T02:00:00.000Z" })
+  ];
+  const auto = computeAutoScore({ weekKey: "2026-10-16", tasks });
+  assert.equal(auto.D, 3);
+});
+
 test("computeAutoScore 对未完成与超时给出零分", () => {
   const tasks = [
     task({ status: "pending", created_at: "2026-10-16T14:00:00.000Z" }),

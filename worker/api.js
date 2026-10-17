@@ -563,6 +563,12 @@ route("POST", /^\/api\/redemptions\/(\d+)\/decide$/, "parent", async ({ env, use
   if (!status) return fail("invalid_status", 400);
   const row = await env.DB.prepare("SELECT * FROM redemptions WHERE id = ?").bind(id).first();
   if (!row) return fail("not_found", 404);
+  if (status === "approved" && row.status !== "approved" && !bool(parsed.body.allowNegative)) {
+    const account = await accountOf(env.DB);
+    if (account.balance < row.points) {
+      return fail("insufficient_points", 409, { missing: row.points - account.balance, balance: account.balance, points: row.points });
+    }
+  }
   await env.DB.prepare("UPDATE redemptions SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?")
     .bind(status, user.id, nowIso(), id)
     .run();

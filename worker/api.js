@@ -63,6 +63,7 @@ function mapTask(row) {
     quality: row.quality,
     actualMinutes: row.actual_minutes,
     sortOrder: row.sort_order,
+    sourceOptionId: row.source_option_id,
     createdBy: row.created_by,
     createdAt: row.created_at,
     doneBy: row.done_by,
@@ -99,6 +100,7 @@ function mapOption(row) {
     estMinutes: row.est_minutes,
     points: row.points,
     sortOrder: row.sort_order,
+    weekly: Boolean(row.weekly),
     active: Boolean(row.active)
   };
 }
@@ -241,7 +243,12 @@ route("POST", /^\/api\/tasks$/, "student", async ({ env, user, request }) => {
   const weekKey = isWeekKey(body.weekKey) ? body.weekKey : weekKeyOf();
   const title = text(body.title, 120);
   if (!title) return fail("invalid_title", 400);
-  const next = await env.DB.prepare("SELECT COALESCE(MAX(sort_order), 0) + 1 AS value FROM tasks WHERE week_key = ?").bind(weekKey).first();
+  const [next, existing] = await Promise.all([
+    env.DB.prepare("SELECT COALESCE(MAX(sort_order), 0) + 1 AS value FROM tasks WHERE week_key = ?").bind(weekKey).first(),
+    env.DB.prepare("SELECT COUNT(*) AS total FROM tasks WHERE week_key = ?").bind(weekKey).first()
+  ]);
+  const baseOrder = Number(next?.value) || 1;
+  const createdAt = nowIso();
   await env.DB.prepare(
     `INSERT INTO tasks (week_key, title, subject, est_minutes, plan_slot, note, status, sort_order, source_option_id, created_by, created_at)
      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`
@@ -253,12 +260,27 @@ route("POST", /^\/api\/tasks$/, "student", async ({ env, user, request }) => {
       integer(body.estMinutes, { min: 0, max: 600, fallback: null }),
       optionalText(body.planSlot, 40),
       optionalText(body.note, 500),
-      Number(next?.value) || 1,
+      baseOrder,
       integer(body.sourceOptionId, { fallback: null }),
       user.id,
-      nowIso()
+      createdAt
     )
     .run();
+  if (!Number(existing?.total)) {
+    const fixed = await env.DB.prepare(
+      "SELECT id, title, subject, est_minutes FROM options WHERE type = 'homework' AND weekly = 1 AND active = 1 ORDER BY sort_order, id"
+    ).all();
+    if (fixed.results.length) {
+      await env.DB.batch(
+        fixed.results.map((option, index) =>
+          env.DB.prepare(
+            `INSERT INTO tasks (week_key, title, subject, est_minutes, plan_slot, note, status, sort_order, source_option_id, created_by, created_at)
+             VALUES (?, ?, ?, ?, NULL, NULL, 'pending', ?, ?, ?, ?)`
+          ).bind(weekKey, option.title, option.subject, option.est_minutes, baseOrder + index + 1, option.id, user.id, createdAt)
+        )
+      );
+    }
+  }
   if (bool(body.saveAsOption)) await saveOption(env, user, { type: "homework", title, subject: body.subject, estMinutes: body.estMinutes });
   return json({ ok: true, week: await weekPayload(env, weekKey) });
 });
@@ -374,7 +396,7 @@ async function saveOption(env, user, body) {
   if (!title) return null;
   const type = ["homework", "reward", "bonus", "deduction"].includes(body.type) ? body.type : "homework";
   await env.DB.prepare(
-    "INSERT INTO options (type, title, subject, est_minutes, points, sort_order, active, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)"
+    "INSERT INTO options (type, title, subject, est_minutes, points, sort_order, active, weekly, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)"
   )
     .bind(
       type,
@@ -383,6 +405,7 @@ async function saveOption(env, user, body) {
       integer(body.estMinutes, { min: 0, max: 600, fallback: null }),
       integer(body.points, { min: -100, max: 200, fallback: null }),
       integer(body.sortOrder, { min: 0, max: 9999, fallback: 0 }),
+      bool(body.weekly) ? 1 : 0,
       user.id,
       nowIso()
     )
@@ -430,6 +453,7 @@ route("PATCH", /^\/api\/options\/(\d+)$/, "parent", async ({ env, request, param
   if (body.estMinutes !== undefined) assign("est_minutes", integer(body.estMinutes, { min: 0, max: 600, fallback: null }));
   if (body.points !== undefined) assign("points", integer(body.points, { min: -100, max: 200, fallback: null }));
   if (body.sortOrder !== undefined) assign("sort_order", integer(body.sortOrder, { min: 0, max: 9999, fallback: 0 }));
+  if (body.weekly !== undefined) assign("weekly", bool(body.weekly) ? 1 : 0);
   if (body.active !== undefined) assign("active", bool(body.active) ? 1 : 0);
   if (!fields.length) return fail("nothing_to_update", 400);
   values.push(id);

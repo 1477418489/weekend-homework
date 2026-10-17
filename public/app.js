@@ -359,6 +359,7 @@ function taskCard(task) {
         <div class="grow">
           <h3>${esc(task.title)}</h3>
           <div class="small muted" style="margin-top:3px">
+            ${task.sourceOptionId ? '<span class="tag">固定</span>' : ""}
             ${task.subject ? `<span class="tag">${esc(task.subject)}</span>` : ""}
             <span class="tag">${esc(minutes)}</span>
             ${task.planSlot ? `<span class="tag">${esc(task.planSlot)}</span>` : ""}
@@ -564,6 +565,10 @@ function renderOptions() {
              <label class="field"><span>预估分钟</span><input name="estMinutes" type="number" min="0" max="600" /></label>`
           : `<label class="field"><span>积分数</span><input name="points" type="number" min="1" max="200" /></label>`}
       </div>
+      ${state.optionType === "homework" ? `
+      <label class="row small" style="gap:6px;margin:8px 0 10px">
+        <input type="checkbox" name="weekly" style="width:auto" /> 设为每周固定作业（本周第一条作业时自动带出）
+      </label>` : ""}
       <input type="hidden" name="type" value="${state.optionType}" />
       <button class="primary" type="submit">添加选项</button>
     </form>
@@ -571,12 +576,13 @@ function renderOptions() {
       ${list.map((option) => `
         <div class="item">
           <div class="grow">
-            <strong>${esc(option.title)}</strong>
+            <strong>${esc(option.title)}</strong>${option.weekly ? ' <span class="tag">每周固定</span>' : ""}
             <div class="small muted">
               ${option.subject ? `${esc(option.subject)} · ` : ""}${option.estMinutes ? `${option.estMinutes} 分钟 · ` : ""}${option.points ? `${option.points} 分 · ` : ""}${option.active ? "启用" : "停用"}
             </div>
           </div>
           ${can("parent") ? `
+            ${option.type === "homework" ? `<button class="tiny" data-act="option-weekly" data-id="${option.id}" data-weekly="${option.weekly}">${option.weekly ? "取消固定" : "设为固定"}</button>` : ""}
             <button class="tiny" data-act="option-toggle" data-id="${option.id}" data-active="${option.active}">${option.active ? "停用" : "启用"}</button>
             <button class="tiny danger" data-act="option-del" data-id="${option.id}">删除</button>` : ""}
         </div>
@@ -789,7 +795,8 @@ document.addEventListener("submit", (event) => {
           title: data.title,
           subject: data.subject,
           estMinutes: data.estMinutes || null,
-          points: data.points || null
+          points: data.points || null,
+          weekly: data.weekly === "on"
         }
       });
       await loadOptions();
@@ -989,6 +996,12 @@ document.addEventListener("click", (event) => {
     "option-toggle": () => run(async () => {
       await api(`/api/options/${id}`, { method: "PATCH", body: { active: trigger.dataset.active !== "true" } });
       await loadOptions();
+    }),
+    "option-weekly": () => run(async () => {
+      const weekly = trigger.dataset.weekly !== "true";
+      await api(`/api/options/${id}`, { method: "PATCH", body: { weekly } });
+      await loadOptions();
+      setNotice(weekly ? "已设为每周固定" : "已取消固定");
     }),
     "option-del": () => {
       if (!confirm("删除这个选项？")) return;

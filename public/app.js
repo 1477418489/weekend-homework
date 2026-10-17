@@ -34,6 +34,7 @@ const ERROR_TEXT = {
   invalid_password: "密码至少 6 位",
   invalid_username: "用户名只能用小写字母、数字、下划线、点和连字符",
   invalid_url: "地址必须以 http:// 或 https:// 开头",
+  invalid_confirm: "确认文字不对，已取消",
   setup_disabled: "服务端未配置 SETUP_TOKEN，无法初始化",
   database_not_configured: "数据库未绑定",
   invalid_rate: "折现比例要在 0–100 之间",
@@ -86,7 +87,7 @@ function fmtTime(iso) {
   if (Number.isNaN(date.getTime())) return "";
   const shifted = new Date(date.getTime() + 8 * 3600 * 1000);
   const pad = (value) => String(value).padStart(2, "0");
-  return `${shifted.getUTCMonth() + 1}/${shifted.getUTCDate()} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+  return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
 }
 
 function fmtMinutes(total) {
@@ -115,6 +116,62 @@ function fmtClock(iso) {
   if (Number.isNaN(date.getTime())) return "";
   const pad = (value) => String(value).padStart(2, "0");
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+const DONE_PRAISE = [
+  "搞定一条，继续保持 ⚡",
+  "漂亮，进度条又长了一截 📈",
+  "干得利索，给自己鼓个掌 👏",
+  "完成一条，离自由时间更近了 🏖️",
+  "稳得很，接着来 ✅"
+];
+
+const CONFETTI_COLORS = ["#4c7cf3", "#f2994a", "#27ae60", "#eb5757", "#9b51e0", "#f2c94c"];
+
+function pickPraise() {
+  return DONE_PRAISE[Math.floor(Math.random() * DONE_PRAISE.length)];
+}
+
+function celebrate(count = 70) {
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  for (let index = 0; index < count; index += 1) {
+    const piece = document.createElement("i");
+    piece.className = "confetti-piece";
+    piece.style.left = `${Math.random() * 100}vw`;
+    piece.style.width = `${6 + Math.random() * 6}px`;
+    piece.style.height = `${8 + Math.random() * 8}px`;
+    piece.style.background = CONFETTI_COLORS[index % CONFETTI_COLORS.length];
+    piece.style.animationDelay = `${(Math.random() * 0.5).toFixed(2)}s`;
+    document.body.appendChild(piece);
+    setTimeout(() => piece.remove(), 3200);
+  }
+}
+
+function earlyPraise(weekKey) {
+  const start = Date.parse(`${weekKey}T00:00:00+08:00`);
+  if (!Number.isFinite(start)) return "等家长确认后计入完成率";
+  const hours = (Date.now() - start) / 3600000;
+  if (hours <= 39) return "周六 15:00 前收工，提前分能拿满 +10 🚀";
+  if (hours <= 42) return "18:00 前收工，提前分 +8 ⚡";
+  if (hours <= 45) return "赶在 21:00 截止前收工，提前分 +5 👌";
+  return "虽然踩线晚了一点，但全部完成就是硬实力 💪";
+}
+
+function cheerText(summary) {
+  if (!summary.total) return "先加一条作业，开个好头 ✏️";
+  const handled = summary.total - summary.pending;
+  if (!handled) return `还有 ${summary.total} 条，先挑最顺手的开工 🚀`;
+  if (!summary.pending) return "全部作业都打卡完成，等家长确认后完成率拉满 🎉";
+  return `已搞定 ${handled}/${summary.total}，剩下的接着冲 💪`;
+}
+
+function rewardNudge() {
+  const balance = Number(state.week.account?.balance) || 0;
+  const rewards = state.options.filter((option) => option.type === "reward" && option.active && option.points);
+  const next = rewards.filter((option) => option.points > balance).sort((a, b) => a.points - b.points)[0];
+  if (next) return `再攒 ${next.points - balance} 分就能换「${esc(next.title)}」，冲一把 🎯`;
+  if (rewards.length) return "积分够用，想换哪个直接申请 🎁";
+  return "";
 }
 
 function totalMinutes(key) {
@@ -303,6 +360,7 @@ function renderTasks() {
         <div><div class="num mono">${detailTotal(detail)}</div><div class="small muted">本周积分（暂算）</div></div>
       </div>
       <div class="bar" style="margin-top:10px"><i style="width:${percent}%"></i></div>
+      <div class="small muted" style="margin-top:6px">${cheerText(summary)}</div>
       ${timeSummary() ? `<div style="margin-top:10px">${timeSummary()}</div>` : ""}
     </div>
     <div class="card">
@@ -426,6 +484,7 @@ function renderRewards() {
   const balance = state.week.account.balance;
   const rewards = optionsOf("reward");
   const redemptions = state.week.redemptions;
+  const nudge = rewardNudge();
   return `
     ${weekBar()}
     <div class="card row between">
@@ -435,6 +494,7 @@ function renderRewards() {
         待审批 ${state.week.account.pending}
       </div>
     </div>
+    ${nudge ? `<div class="small muted" style="margin:-2px 2px 10px">${nudge}</div>` : ""}
     <h2>奖励目录</h2>
     ${rewards.map((option) => `
       <div class="card row between">
@@ -654,6 +714,11 @@ function renderAdmin() {
           </div>
         </div>
       `).join("") || '<div class="item muted">还没有备份记录</div>'}
+    </div>
+    <h2>初始化</h2>
+    <div class="card">
+      <div class="small muted" style="margin-bottom:10px">清空全部作业、加扣分、每周结算和兑换记录，积分账户归零；账号、选项库、折现比例和备份配置保留。适合开学或重新开始，操作不可撤销。</div>
+      <button class="danger" data-act="reset-all">一键初始化作业与分数</button>
     </div>
   `;
 }
@@ -914,7 +979,13 @@ document.addEventListener("click", (event) => {
     },
     "task-done": () => run(async () => {
       state.week = (await api(`/api/tasks/${id}/done`, { method: "POST", body: { actualMinutes: inlineMinutes(id) } })).week;
-      setNotice("已打卡，等家长确认");
+      const summary = state.week.summary;
+      if (summary.pending) {
+        setNotice(`${pickPraise()} 还剩 ${summary.pending} 条`);
+      } else {
+        celebrate(90);
+        setNotice(`🎉 全部作业搞定！${earlyPraise(state.weekKey)}，喊家长来验收`);
+      }
     }),
     "task-confirm": () => run(async () => {
       state.week = (await api(`/api/tasks/${id}/confirm`, { method: "POST" })).week;
@@ -1029,7 +1100,17 @@ document.addEventListener("click", (event) => {
     }),
     "backup-reload": () => run(async () => {
       await loadAdmin();
-    })
+    }),
+    "reset-all": () => {
+      if (!confirm("将清空全部作业、加扣分、结算和兑换记录，且无法恢复。继续？")) return;
+      const answer = prompt("输入「初始化」两个字确认");
+      if (answer !== "初始化") return;
+      run(async () => {
+        await api("/api/reset", { method: "POST", body: { confirm: answer } });
+        await refreshAll();
+        setNotice("已初始化，作业和分数已清空");
+      });
+    }
   };
 
   const handler = actions[act];

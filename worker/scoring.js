@@ -49,7 +49,8 @@ export function weekDeadlines(weekKey) {
 export function weekLabel(weekKey) {
   const format = (ms) => {
     const date = new Date(ms + TZ_OFFSET_MS);
-    return `${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
+    const pad = (value) => String(value).padStart(2, "0");
+    return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`;
   };
   const start = weekStartMs(weekKey);
   return `${format(start)} 周五 ~ ${format(start + 2 * DAY_MS)} 周日`;

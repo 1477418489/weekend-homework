@@ -692,6 +692,19 @@ route("POST", /^\/api\/backup\/run$/, "admin", async ({ env }) => {
   return json(await runBackup(env, { trigger: "manual" }));
 });
 
+route("POST", /^\/api\/reset$/, "admin", async ({ env, request }) => {
+  const parsed = await readJson(request);
+  if (parsed.response) return parsed.response;
+  if (parsed.body.confirm !== "初始化") return fail("invalid_confirm", 400);
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM tasks"),
+    env.DB.prepare("DELETE FROM bonus_items"),
+    env.DB.prepare("DELETE FROM week_scores"),
+    env.DB.prepare("DELETE FROM redemptions")
+  ]);
+  return json({ ok: true });
+});
+
 route("GET", /^\/api\/backup\/log$/, "admin", async ({ env, url }) => {
   const limit = integer(url.searchParams.get("limit"), { min: 1, max: 100, fallback: 20 });
   return json({ log: await backupLog(env.DB, limit) });

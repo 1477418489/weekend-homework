@@ -179,3 +179,31 @@ th { color: var(--muted); font-weight: 500; font-size: 12.5px; }
 @media (max-width: 420px) {
   .grid3 { grid-template-columns: 1fr 1fr; }
 }
+
+.bar > i { transition: width 0.4s ease; }
+
+@keyframes pop-in {
+  0% { transform: scale(0.96); }
+  60% { transform: scale(1.02); }
+  100% { transform: scale(1); }
+}
+.notice.ok { animation: pop-in 0.3s ease; }
+
+.confetti-piece {
+  position: fixed;
+  top: -14px;
+  z-index: 999;
+  pointer-events: none;
+  border-radius: 2px;
+  animation: confetti-fall 2s ease-in forwards;
+}
+
+@keyframes confetti-fall {
+  0% { transform: translateY(0) rotate(0); opacity: 1; }
+  100% { transform: translateY(106vh) rotate(660deg); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bar > i, .notice.ok, .confetti-piece { animation: none; transition: none; }
+  .confetti-piece { display: none; }
+}

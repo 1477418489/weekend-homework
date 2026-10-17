@@ -35,7 +35,7 @@ test("weekDeadlines 对应周五 21:00 与周六三档", () => {
   assert.equal(new Date(deadlines.saturdayEarly).toISOString(), "2026-10-17T07:00:00.000Z");
   assert.equal(new Date(deadlines.saturdayMid).toISOString(), "2026-10-17T10:00:00.000Z");
   assert.equal(new Date(deadlines.saturdayHard).toISOString(), "2026-10-17T13:00:00.000Z");
-  assert.equal(weekLabel("2026-10-16"), "10/16 周五 ~ 10/18 周日");
+  assert.equal(weekLabel("2026-10-16"), "2026-10-16 周五 ~ 2026-10-18 周日");
 });
 
 test("scoreFromRate 按 90/80/70 分档", () => {

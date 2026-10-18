@@ -16,12 +16,16 @@ import {
   SCORE_KEYS,
   SCORE_LABEL,
   SCORE_MAX,
-  WEEK_HINT,
   canonicalWeekKey,
   completionRate,
   computeAutoScore,
   normalizeDetail,
+  resolveWeekDeadlines,
+  scheduleHint,
+  scheduleLabel,
+  shiftWeek,
   totalOf,
+  weekStartMs,
   weekKeyOf,
   weekLabel
 } from "./scoring.js";
@@ -129,6 +133,58 @@ export async function previousRates(db, weekKey) {
   return rates;
 }
 
+const SCHEDULE_COLUMNS = {
+  fridayChecklist: "checklist_at",
+  saturdayEarly: "early_at",
+  saturdayMid: "mid_at",
+  saturdayHard: "hard_at",
+  weekEnd: "week_end"
+};
+const SCHEDULE_LIMIT_MS = 60 * 24 * 60 * 60 * 1000;
+
+function mapSchedule(row) {
+  if (!row) return null;
+  const schedule = {};
+  for (const [key, column] of Object.entries(SCHEDULE_COLUMNS)) {
+    const value = row[column];
+    if (!value) continue;
+    const ms = Date.parse(value);
+    if (Number.isFinite(ms)) schedule[key] = ms;
+  }
+  schedule.rangeStart = row.range_start || null;
+  schedule.rangeEnd = row.range_end || null;
+  schedule.note = row.note || null;
+  return schedule;
+}
+
+async function loadSchedule(db, weekKey) {
+  const row = await db.prepare("SELECT * FROM week_schedules WHERE week_key = ?").bind(weekKey).first();
+  return mapSchedule(row);
+}
+
+// 默认的收工时间是周日 24:00。如果下一周被提前成节假日（比如从周三开始放假），
+// 这一周的收工时间跟着提前，免得拖到新一段假期里还要补上一周的作业。
+async function resolveDeadlines(db, weekKey) {
+  const [schedule, nextSchedule] = await Promise.all([
+    loadSchedule(db, weekKey),
+    loadSchedule(db, shiftWeek(weekKey, 1))
+  ]);
+  const deadlines = resolveWeekDeadlines(weekKey, schedule);
+  const nextStart = nextSchedule?.rangeStart ? Date.parse(`${nextSchedule.rangeStart}T00:00:00.000+08:00`) : NaN;
+  if (Number.isFinite(nextStart) && nextStart < deadlines.weekEnd) deadlines.weekEnd = nextStart;
+  return deadlines;
+}
+
+function timestampMs(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const ms = Date.parse(value.trim());
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function isoSecond(ms) {
+  return new Date(Math.round(ms / 1000) * 1000).toISOString();
+}
+
 async function accountOf(db) {
   const [earned, spent, pending] = await Promise.all([
     db.prepare("SELECT COALESCE(SUM(total), 0) AS total FROM week_scores").first(),
@@ -148,14 +204,30 @@ async function readSettleRate(db) {
 
 async function weekPayload(env, weekKey) {
   const data = await loadWeek(env, weekKey);
-  const [rates, rate] = await Promise.all([previousRates(env.DB, weekKey), readSettleRate(env.DB)]);
-  const auto = computeAutoScore({ weekKey, tasks: data.tasks, bonusItems: data.bonusItems, prevRates: rates });
+  const [rates, rate, schedule, deadlines] = await Promise.all([
+    previousRates(env.DB, weekKey),
+    readSettleRate(env.DB),
+    loadSchedule(env.DB, weekKey),
+    resolveDeadlines(env.DB, weekKey)
+  ]);
+  const auto = computeAutoScore({ weekKey, tasks: data.tasks, bonusItems: data.bonusItems, prevRates: rates, deadlines });
   const confirmed = data.tasks.filter((task) => task.status === "confirmed").length;
   return {
     weekKey,
-    label: weekLabel(weekKey),
+    label: scheduleLabel(weekKey, schedule),
     isCurrent: weekKey === weekKeyOf(),
-    hint: WEEK_HINT,
+    hint: scheduleHint(deadlines),
+    schedule: {
+      ...(schedule || {}),
+      deadlines: {
+        fridayChecklist: deadlines.fridayChecklist,
+        saturdayEarly: deadlines.saturdayEarly,
+        saturdayMid: deadlines.saturdayMid,
+        saturdayHard: deadlines.saturdayHard,
+        weekEnd: deadlines.weekEnd
+      },
+      custom: Boolean(schedule && (schedule.rangeStart || Object.keys(SCHEDULE_COLUMNS).some((key) => schedule[key])))
+    },
     rate,
     scoreKeys: SCORE_KEYS.map((key) => ({ key, label: SCORE_LABEL[key], max: SCORE_MAX[key] })),
     tasks: data.tasks.map(mapTask),
@@ -529,6 +601,132 @@ route("PUT", /^\/api\/rate$/, "parent", async ({ env, request }) => {
     .bind(SETTLE_RATE_KEY, value, nowIso())
     .run();
   return json({ ok: true, rate: Number(value) });
+});
+
+route("GET", /^\/api\/schedule$/, "student", async ({ env, url }) => {
+  const weekKey = pickWeek(url);
+  const [schedule, deadlines] = await Promise.all([loadSchedule(env.DB, weekKey), resolveDeadlines(env.DB, weekKey)]);
+  return json({
+    weekKey,
+    label: scheduleLabel(weekKey, schedule),
+    hint: scheduleHint(deadlines),
+    schedule: {
+      ...(schedule || {}),
+      deadlines: {
+        fridayChecklist: deadlines.fridayChecklist,
+        saturdayEarly: deadlines.saturdayEarly,
+        saturdayMid: deadlines.saturdayMid,
+        saturdayHard: deadlines.saturdayHard,
+        weekEnd: deadlines.weekEnd
+      },
+      custom: Boolean(schedule && (schedule.rangeStart || Object.keys(SCHEDULE_COLUMNS).some((key) => schedule[key])))
+    }
+  });
+});
+
+route("PUT", /^\/api\/schedule$/, "parent", async ({ env, user, request }) => {
+  const parsed = await readJson(request);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
+  const weekKey = canonicalWeekKey(body.weekKey) || weekKeyOf();
+  const anchor = weekStartMs(weekKey);
+
+  // 空值 = 用默认时间；给了值就必须是合法时间，并且落在这一周前后一个月内，避免手滑写成别的年份。
+  const readTime = (value, label) => {
+    if (value === undefined || value === null || value === "") return { value: null };
+    const ms = timestampMs(value);
+    if (ms === null) return { error: `invalid_${label}` };
+    if (Math.abs(ms - anchor) > SCHEDULE_LIMIT_MS) return { error: `invalid_${label}` };
+    return { value: ms };
+  };
+
+  const checklist = readTime(body.fridayChecklist, "checklist");
+  const early = readTime(body.saturdayEarly, "early");
+  const mid = readTime(body.saturdayMid, "mid");
+  const hard = readTime(body.saturdayHard, "hard");
+  const weekEndOverride = readTime(body.weekEnd, "week_end");
+  const error = [checklist, early, mid, hard, weekEndOverride].find((item) => item.error);
+  if (error) return fail(error.error, 400);
+
+  const weekEnd = weekEndOverride.value ?? anchor + 3 * 24 * 60 * 60 * 1000;
+  const ordered = [checklist.value, early.value, mid.value, hard.value].filter((value) => value !== null);
+  for (const value of ordered) {
+    if (value > weekEnd) return fail("invalid_schedule_order", 400);
+  }
+  const strict = [checklist.value, early.value, mid.value].filter((value) => value !== null);
+  for (let index = 1; index < strict.length; index += 1) {
+    if (strict[index] < strict[index - 1]) return fail("invalid_schedule_order", 400);
+  }
+  if (hard.value !== null && early.value !== null && hard.value < early.value) return fail("invalid_schedule_order", 400);
+
+  const isWeekKey = (value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(`${value}T00:00:00.000+08:00`));
+  const rangeStart = isWeekKey(body.rangeStart) ? body.rangeStart : null;
+  const rangeEnd = isWeekKey(body.rangeEnd) ? body.rangeEnd : null;
+  if ((rangeStart && !rangeEnd) || (!rangeStart && rangeEnd)) return fail("invalid_range", 400);
+  if (rangeStart && rangeEnd && Date.parse(`${rangeEnd}T00:00:00.000+08:00`) < Date.parse(`${rangeStart}T00:00:00.000+08:00`)) {
+    return fail("invalid_range", 400);
+  }
+  if ((rangeStart && Math.abs(Date.parse(`${rangeStart}T00:00:00.000+08:00`) - anchor) > SCHEDULE_LIMIT_MS) ||
+      (rangeEnd && Math.abs(Date.parse(`${rangeEnd}T00:00:00.000+08:00`) - anchor) > SCHEDULE_LIMIT_MS)) {
+    return fail("invalid_range", 400);
+  }
+
+  const note = optionalText(body.note, 60);
+  const hasCustom = Boolean(rangeStart || note || checklist.value !== null || early.value !== null || mid.value !== null || hard.value !== null || weekEndOverride.value !== null);
+  if (!hasCustom) {
+    await env.DB.prepare("DELETE FROM week_schedules WHERE week_key = ?").bind(weekKey).run();
+    const deadlines = await resolveDeadlines(env.DB, weekKey);
+    return json({ ok: true, weekKey, label: scheduleLabel(weekKey, null), hint: scheduleHint(deadlines), schedule: null });
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO week_schedules (week_key, checklist_at, early_at, mid_at, hard_at, week_end, range_start, range_end, note, updated_by, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(week_key) DO UPDATE SET
+       checklist_at = excluded.checklist_at,
+       early_at = excluded.early_at,
+       mid_at = excluded.mid_at,
+       hard_at = excluded.hard_at,
+       week_end = excluded.week_end,
+       range_start = excluded.range_start,
+       range_end = excluded.range_end,
+       note = excluded.note,
+       updated_by = excluded.updated_by,
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      weekKey,
+      checklist.value === null ? null : isoSecond(checklist.value),
+      early.value === null ? null : isoSecond(early.value),
+      mid.value === null ? null : isoSecond(mid.value),
+      hard.value === null ? null : isoSecond(hard.value),
+      weekEndOverride.value === null ? null : isoSecond(weekEndOverride.value),
+      rangeStart,
+      rangeEnd,
+      note,
+      user.id,
+      nowIso()
+    )
+    .run();
+  const schedule = await loadSchedule(env.DB, weekKey);
+  const deadlines = await resolveDeadlines(env.DB, weekKey);
+  return json({
+    ok: true,
+    weekKey,
+    label: scheduleLabel(weekKey, schedule),
+    hint: scheduleHint(deadlines),
+    schedule: {
+      ...(schedule || {}),
+      deadlines: {
+        fridayChecklist: deadlines.fridayChecklist,
+        saturdayEarly: deadlines.saturdayEarly,
+        saturdayMid: deadlines.saturdayMid,
+        saturdayHard: deadlines.saturdayHard,
+        weekEnd: deadlines.weekEnd
+      },
+      custom: true
+    }
+  });
 });
 
 route("GET", /^\/api\/redemptions$/, "student", async ({ env, url }) => {

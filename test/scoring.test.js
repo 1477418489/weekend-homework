@@ -5,6 +5,9 @@ import {
   canonicalWeekKey,
   computeAutoScore,
   normalizeDetail,
+  resolveWeekDeadlines,
+  scheduleHint,
+  scheduleLabel,
   scoreFromRate,
   shiftWeek,
   totalOf,
@@ -107,6 +110,49 @@ test("computeAutoScore 对未完成与超时给出零分", () => {
   assert.equal(auto.B, 0);
   assert.equal(auto.C, 0);
   assert.equal(auto.E, 0);
+});
+
+test("resolveWeekDeadlines 支持按节假日覆盖单周时间", () => {
+  const fallback = weekDeadlines("2026-10-16");
+  const custom = resolveWeekDeadlines("2026-10-16", {
+    saturdayEarly: Date.parse("2026-10-07T15:00:00+08:00"),
+    saturdayMid: Date.parse("2026-10-07T18:00:00+08:00"),
+    saturdayHard: Date.parse("2026-10-07T21:00:00+08:00"),
+    weekEnd: Date.parse("2026-10-08T24:00:00+08:00")
+  });
+  assert.equal(custom.saturdayEarly, Date.parse("2026-10-07T15:00:00+08:00"));
+  assert.equal(custom.weekEnd, Date.parse("2026-10-09T00:00:00+08:00"));
+  assert.equal(custom.fridayChecklist, fallback.fridayChecklist);
+});
+
+test("computeAutoScore 按自定义放假时间算提前分", () => {
+  const deadlines = {
+    fridayChecklist: Date.parse("2026-09-30T21:00:00+08:00"),
+    saturdayEarly: Date.parse("2026-10-06T15:00:00+08:00"),
+    saturdayMid: Date.parse("2026-10-07T18:00:00+08:00"),
+    saturdayHard: Date.parse("2026-10-08T21:00:00+08:00"),
+    weekEnd: Date.parse("2026-10-09T00:00:00+08:00")
+  };
+  const base = { weekKey: "2026-10-02", bonusItems: [], deadlines };
+  const tasks = [
+    task({ status: "confirmed", quality: 4, created_at: "2026-09-30T10:00:00.000Z", done_at: "2026-10-06T02:00:00.000Z" })
+  ];
+  assert.equal(computeAutoScore({ ...base, tasks }).E, 10);
+  assert.equal(computeAutoScore({ ...base, tasks: [task({ ...tasks[0], done_at: "2026-10-07T02:00:00.000Z" })] }).E, 8);
+  assert.equal(computeAutoScore({ ...base, tasks: [task({ ...tasks[0], done_at: "2026-10-08T02:00:00.000Z" })] }).E, 5);
+  assert.equal(computeAutoScore({ ...base, tasks: [task({ ...tasks[0], done_at: "2026-10-10T02:00:00.000Z" })] }).E, 0);
+});
+
+test("scheduleHint 与 scheduleLabel 显示放假区间", () => {
+  const deadlines = resolveWeekDeadlines("2026-10-02", {
+    saturdayEarly: Date.parse("2026-10-06T15:00:00+08:00"),
+    saturdayMid: Date.parse("2026-10-07T18:00:00+08:00"),
+    saturdayHard: Date.parse("2026-10-08T21:00:00+08:00"),
+    weekEnd: Date.parse("2026-10-09T00:00:00+08:00")
+  });
+  assert.equal(scheduleHint(deadlines), "清单截止 10-02 21:00 / 提前分 10-06 15:00 · 10-07 18:00 · 10-08 21:00 / 收工截止 10-09 00:00");
+  assert.equal(scheduleLabel("2026-10-02", { rangeStart: "2026-10-01", rangeEnd: "2026-10-08" }), "2026-10-01 ~ 2026-10-08");
+  assert.equal(scheduleLabel("2026-10-02", null), "2026-10-02 周五 ~ 2026-10-04 周日");
 });
 
 test("computeAutoScore 连续两周达标给连胜分", () => {

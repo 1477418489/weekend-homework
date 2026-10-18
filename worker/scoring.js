@@ -15,8 +15,6 @@ export const SCORE_LABEL = {
   H: "连胜分"
 };
 
-export const WEEK_HINT = "周五 21:00 清单 / 周六 15:00-21:00 三档提前分 / 周六 21:00 硬截止";
-
 const WEEK_KEY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 export function isWeekKey(value) {
@@ -56,6 +54,43 @@ export function weekDeadlines(weekKey) {
   };
 }
 
+const SCHEDULE_KEYS = ["fridayChecklist", "saturdayEarly", "saturdayMid", "saturdayHard", "weekEnd"];
+
+export function resolveWeekDeadlines(weekKey, schedule) {
+  const fallback = weekDeadlines(weekKey);
+  if (!schedule) return fallback;
+  const merged = { ...fallback };
+  for (const key of SCHEDULE_KEYS) {
+    const value = Number(schedule[key]);
+    if (Number.isFinite(value)) merged[key] = value;
+  }
+  return merged;
+}
+
+export function scheduleHint(deadlines) {
+  const format = (ms) => {
+    const date = new Date(Number(ms) + TZ_OFFSET_MS);
+    const pad = (value) => String(value).padStart(2, "0");
+    return `${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+  };
+  return `清单截止 ${format(deadlines.fridayChecklist)} / 提前分 ${format(deadlines.saturdayEarly)} · ${format(deadlines.saturdayMid)} · ${format(deadlines.saturdayHard)} / 收工截止 ${format(deadlines.weekEnd)}`;
+}
+
+export function scheduleLabel(weekKey, schedule) {
+  if (!schedule || !schedule.rangeStart || !schedule.rangeEnd) return weekLabel(weekKey);
+  const format = (value) => {
+    const date = new Date(Date.parse(`${value}T00:00:00.000+08:00`));
+    if (Number.isNaN(date.getTime())) return null;
+    const shifted = new Date(date.getTime() + TZ_OFFSET_MS);
+    const pad = (item) => String(item).padStart(2, "0");
+    return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}`;
+  };
+  const start = format(schedule.rangeStart);
+  const end = format(schedule.rangeEnd);
+  if (!start || !end) return weekLabel(weekKey);
+  return `${start} ~ ${end}`;
+}
+
 export function weekLabel(weekKey) {
   const format = (ms) => {
     const date = new Date(ms + TZ_OFFSET_MS);
@@ -83,11 +118,9 @@ export function scoreFromRate(rate) {
   return 0;
 }
 
-function scoreFromDeadlines(weekKey, lastDoneAt) {
-  if (!lastDoneAt) return 0;
+function scoreFromDeadlines(lastDoneAt, deadlines) {
   const at = Date.parse(lastDoneAt);
   if (!Number.isFinite(at)) return 0;
-  const deadlines = weekDeadlines(weekKey);
   if (at <= deadlines.saturdayEarly) return 10;
   if (at <= deadlines.saturdayMid) return 8;
   if (at <= deadlines.saturdayHard) return 5;
@@ -112,12 +145,12 @@ function qualityScore(tasks) {
   return Math.min(SCORE_MAX.D, Math.round(total));
 }
 
-export function computeAutoScore({ weekKey, tasks, bonusItems = [], prevRates = [] }) {
+export function computeAutoScore({ weekKey, tasks, bonusItems = [], prevRates = [], deadlines: override }) {
   const sortedCreated = tasks
     .map((task) => Date.parse(task.created_at))
     .filter((value) => Number.isFinite(value))
     .sort((a, b) => a - b);
-  const deadlines = weekDeadlines(weekKey);
+  const deadlines = resolveWeekDeadlines(weekKey, override);
   const A = sortedCreated.length && sortedCreated[0] <= deadlines.fridayChecklist ? SCORE_MAX.A : 0;
 
   const planned = tasks.filter((task) => task.plan_slot).length;
@@ -132,7 +165,8 @@ export function computeAutoScore({ weekKey, tasks, bonusItems = [], prevRates = 
     .filter((task) => task.done_at)
     .map((task) => Date.parse(task.done_at))
     .filter((value) => Number.isFinite(value));
-  const E = doneTimes.length ? scoreFromDeadlines(weekKey, new Date(Math.max(...doneTimes)).toISOString()) : 0;
+  const lastDoneAt = doneTimes.length ? new Date(Math.max(...doneTimes)).toISOString() : null;
+  const E = lastDoneAt ? scoreFromDeadlines(lastDoneAt, deadlines) : 0;
 
   const H = prevRates.length >= 2 && prevRates.slice(0, 2).every((value) => value >= 0.9) ? SCORE_MAX.H : 0;
 
@@ -150,7 +184,7 @@ export function computeAutoScore({ weekKey, tasks, bonusItems = [], prevRates = 
     H,
     bonus,
     deduction,
-    auto: { rate, planRatio, lastDoneAt: doneTimes.length ? new Date(Math.max(...doneTimes)).toISOString() : null }
+    auto: { rate, planRatio, lastDoneAt }
   };
 }
 

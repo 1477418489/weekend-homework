@@ -14,6 +14,7 @@ const state = {
   editing: null,
   addTask: false,
   optionType: "homework",
+  scheduleOpen: false,
   error: "",
   notice: "",
   busy: false
@@ -38,6 +39,13 @@ const ERROR_TEXT = {
   setup_disabled: "服务端未配置 SETUP_TOKEN，无法初始化",
   database_not_configured: "数据库未绑定",
   invalid_rate: "折现比例要在 0–100 之间",
+  invalid_checklist: "清单截止时间不对",
+  invalid_early: "提前分第一档时间不对",
+  invalid_mid: "提前分第二档时间不对",
+  invalid_hard: "提前分第三档时间不对",
+  invalid_week_end: "收工截止时间不对",
+  invalid_range: "放假起止日期不对",
+  invalid_schedule_order: "时间先后不对：清单截止 ≤ 提前分三档 ≤ 收工截止",
   insufficient_points: "积分不够，先驳回或确认透支",
   server_error: "服务端出错，稍后重试"
 };
@@ -155,13 +163,69 @@ function celebrate(count = 70) {
   }
 }
 
-function earlyPraise(weekKey) {
+function fmtDay(ms) {
+  const date = new Date(Number(ms));
+  if (Number.isNaN(date.getTime())) return "";
+  const shifted = new Date(date.getTime() + 8 * 3600 * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${shifted.getUTCMonth() + 1}/${shifted.getUTCDate()} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+}
+
+function deadlinesOf(week = state.week) {
+  const schedule = week?.schedule;
+  if (schedule?.deadlines) return schedule.deadlines;
+  if (schedule && ["fridayChecklist", "saturdayEarly", "saturdayMid", "saturdayHard", "weekEnd"].some((key) => Number.isFinite(Number(schedule[key])))) {
+    const base = weekDeadlinesClient(week.weekKey);
+    for (const key of Object.keys(base)) {
+      if (Number.isFinite(Number(schedule[key]))) base[key] = Number(schedule[key]);
+    }
+    return base;
+  }
+  return weekDeadlinesClient(week?.weekKey || state.weekKey);
+}
+
+function weekDeadlinesClient(weekKey) {
   const start = Date.parse(`${weekKey}T00:00:00+08:00`);
-  if (!Number.isFinite(start)) return "等家长确认后计入完成率";
-  const hours = (Date.now() - start) / 3600000;
-  if (hours <= 39) return "周六 15:00 前收工，提前分能拿满 +10 🚀";
-  if (hours <= 42) return "18:00 前收工，提前分 +8 ⚡";
-  if (hours <= 45) return "赶在 21:00 截止前收工，提前分 +5 👌";
+  if (!Number.isFinite(start)) return { fridayChecklist: 0, saturdayEarly: 0, saturdayMid: 0, saturdayHard: 0, weekEnd: 0 };
+  return {
+    fridayChecklist: start + 21 * 3600000,
+    saturdayEarly: start + 39 * 3600000,
+    saturdayMid: start + 42 * 3600000,
+    saturdayHard: start + 45 * 3600000,
+    weekEnd: start + 3 * 86400000
+  };
+}
+
+function deadlineHint(week = state.week) {
+  if (!week) return "";
+  const deadlines = deadlinesOf(week);
+  if (!Number.isFinite(deadlines.fridayChecklist) || !deadlines.fridayChecklist) return week.hint || "";
+  return `清单截止 ${fmtDay(deadlines.fridayChecklist)} · 提前分三档 ${fmtDay(deadlines.saturdayEarly)} / ${fmtDay(deadlines.saturdayMid)} / ${fmtDay(deadlines.saturdayHard)} · 收工截止 ${fmtDay(deadlines.weekEnd)}`;
+}
+
+function toLocalInput(iso) {
+  if (!iso) return "";
+  const ms = typeof iso === "number" ? iso : Date.parse(iso);
+  if (!Number.isFinite(ms)) return "";
+  const shifted = new Date(ms + 8 * 3600000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}T${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+}
+
+function fromLocalInput(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const parsed = Date.parse(`${raw.length === 16 ? raw : raw.slice(0, 16)}:00+08:00`);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+function earlyPraise(week = state.week) {
+  const deadlines = deadlinesOf(week);
+  const now = Date.now();
+  if (!Number.isFinite(deadlines.saturdayHard)) return "等家长确认后计入完成率";
+  if (now <= deadlines.saturdayEarly) return `提前分能拿满 +10 🚀（${fmtDay(deadlines.saturdayEarly)} 前）`;
+  if (now <= deadlines.saturdayMid) return `提前分 +8 ⚡（${fmtDay(deadlines.saturdayMid)} 前）`;
+  if (now <= deadlines.saturdayHard) return `赶在 ${fmtDay(deadlines.saturdayHard)} 收工，提前分 +5 👌`;
   return "虽然踩线晚了一点，但全部完成就是硬实力 💪";
 }
 
@@ -335,7 +399,7 @@ function render() {
 function banner() {
   if (state.error) return `<div class="notice error">${esc(state.error)}</div>`;
   if (state.notice) return `<div class="notice ok">${esc(state.notice)}</div>`;
-  return `<div class="notice info small">${esc(state.week?.hint || "")}</div>`;
+  return `<div class="notice info small">${esc(deadlineHint())}</div>`;
 }
 
 function renderTab() {
@@ -561,11 +625,45 @@ function renderRewards() {
   `;
 }
 
+function renderSchedule() {
+  const schedule = state.week.schedule || {};
+  const deadlines = deadlinesOf();
+  const isCustom = Boolean(schedule.custom);
+  return `
+    <div class="card">
+      <div class="row between">
+        <strong>本周时间设置</strong>
+        <button class="tiny" data-act="schedule-toggle">${state.scheduleOpen ? "收起" : "修改"}</button>
+      </div>
+      <div class="small muted" style="margin-top:6px">${esc(deadlineHint())}</div>
+      ${isCustom && schedule.note ? `<div class="small" style="margin-top:4px">备注：${esc(schedule.note)}</div>` : ""}
+      ${state.scheduleOpen ? `
+        <form class="editor" data-form="schedule">
+          <div class="small muted" style="margin-bottom:8px">放假不一定在周五到周日，这里可以按实际假期改清单截止、提前分三档和收工截止；留空表示用默认值（清单周五 21:00、提前分周六 15:00/18:00/21:00、收工周日 24:00）。</div>
+          <div class="grid2">
+            <label class="field"><span>放假开始日期（可选）</span><input name="rangeStart" type="date" value="${esc(schedule.rangeStart || "")}" /></label>
+            <label class="field"><span>放假结束日期（可选）</span><input name="rangeEnd" type="date" value="${esc(schedule.rangeEnd || "")}" /></label>
+          </div>
+          <label class="field"><span>清单截止（留空 = 默认周五 21:00）</span><input name="fridayChecklist" type="datetime-local" value="${schedule.custom ? toLocalInput(schedule.fridayChecklist) : ""}" /><span class="small muted">当前生效：${fmtDay(deadlines.fridayChecklist)}</span></label>
+          <label class="field"><span>提前分：满分档（默认周六 15:00）</span><input name="saturdayEarly" type="datetime-local" value="${schedule.custom ? toLocalInput(schedule.saturdayEarly) : ""}" /><span class="small muted">当前生效：${fmtDay(deadlines.saturdayEarly)}</span></label>
+          <label class="field"><span>提前分：+8 档（默认周六 18:00）</span><input name="saturdayMid" type="datetime-local" value="${schedule.custom ? toLocalInput(schedule.saturdayMid) : ""}" /><span class="small muted">当前生效：${fmtDay(deadlines.saturdayMid)}</span></label>
+          <label class="field"><span>提前分：+5 档 / 收工（默认周六 21:00）</span><input name="saturdayHard" type="datetime-local" value="${schedule.custom ? toLocalInput(schedule.saturdayHard) : ""}" /><span class="small muted">当前生效：${fmtDay(deadlines.saturdayHard)}</span></label>
+          <label class="field"><span>收工截止（默认周日 24:00）</span><input name="weekEnd" type="datetime-local" value="${schedule.custom ? toLocalInput(schedule.weekEnd) : ""}" /><span class="small muted">当前生效：${fmtDay(deadlines.weekEnd)}</span></label>
+          <label class="field"><span>备注（可选）</span><input name="note" maxlength="60" value="${esc(schedule.note || "")}" placeholder="例如：国庆放假 10-01 到 10-08" /></label>
+          <div class="actions">
+            <button class="primary" type="submit">保存时间</button>
+            <button type="button" class="ghost" data-act="schedule-default">恢复默认周五到周日</button>
+          </div>
+        </form>` : ""}
+    </div>`;
+}
+
 function renderSettle() {
   const detail = currentDetail();
   const settled = Boolean(state.week.score);
   return `
     ${weekBar()}
+    ${can("parent") ? renderSchedule() : ""}
     <div class="card">
       <strong>本周结算</strong>
       <div class="small muted" style="margin:4px 0 12px">灰字是系统按规则算出的值，可以直接改成最终分。总扣分不超过 30 分。</div>
@@ -875,6 +973,22 @@ document.addEventListener("submit", (event) => {
     });
   }
 
+  if (name === "schedule") {
+    run(async () => {
+      const payload = { weekKey: state.weekKey };
+      for (const key of ["fridayChecklist", "saturdayEarly", "saturdayMid", "saturdayHard", "weekEnd"]) {
+        payload[key] = data[key] ? fromLocalInput(data[key]) : null;
+      }
+      payload.rangeStart = data.rangeStart || null;
+      payload.rangeEnd = data.rangeEnd || null;
+      payload.note = data.note || null;
+      await api("/api/schedule", { method: "PUT", body: payload });
+      await loadWeek();
+      state.scheduleOpen = false;
+      setNotice("本周时间已保存");
+    });
+  }
+
   if (name === "bonus-add") {
     run(async () => {
       await api("/api/bonus", { method: "POST", body: { weekKey: state.weekKey, kind: data.kind, title: data.title, points: data.points } });
@@ -1001,6 +1115,18 @@ document.addEventListener("click", (event) => {
       await loadWeek(shiftWeekKey(state.weekKey, Number(trigger.dataset.delta)));
       await loadOptions();
     }),
+    "schedule-toggle": () => {
+      state.scheduleOpen = !state.scheduleOpen;
+      render();
+    },
+    "schedule-default": () => {
+      const form = document.querySelector("form[data-form=schedule]");
+      if (!form) return;
+      for (const key of ["fridayChecklist", "saturdayEarly", "saturdayMid", "saturdayHard", "weekEnd", "rangeStart", "rangeEnd", "note"]) {
+        form.elements.namedItem(key).value = "";
+      }
+      setNotice("表单已清空为默认值，点「保存时间」生效");
+    },
     "toggle-add": () => {
       state.addTask = !state.addTask;
       render();
@@ -1024,7 +1150,7 @@ document.addEventListener("click", (event) => {
         setNotice(`${pickPraise()} 还剩 ${summary.pending} 条`);
       } else {
         celebrate(90);
-        setNotice(`🎉 全部作业搞定！${earlyPraise(state.weekKey)}，喊家长来验收`);
+        setNotice(`🎉 全部作业搞定！${earlyPraise()}，喊家长来验收`);
       }
     }),
     "task-confirm": () => run(async () => {

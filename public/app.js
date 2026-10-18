@@ -382,6 +382,8 @@ function detailTotal(detail) {
   return Math.max(0, sum + (Number(detail.bonus) || 0) - (Number(detail.deduction) || 0));
 }
 
+const BRAND_SVG = `<svg class="brand" viewBox="0 0 48 48" aria-hidden="true" focusable="false"><defs><linearGradient id="whLogoBg" x1="0" y1="0" x2="48" y2="48" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#2563eb" /><stop offset="1" stop-color="#06b6d4" /></linearGradient></defs><rect width="48" height="48" fill="url(#whLogoBg)" /><rect x="9.5" y="8" width="29" height="32" rx="7" fill="#ffffff" /><rect x="15" y="14.5" width="18" height="2.8" rx="1.4" fill="#cbd5e1" /><rect x="15" y="21" width="12" height="2.8" rx="1.4" fill="#cbd5e1" /><path d="M15.5 30.2l4.6 4.6 9.6-10.2" fill="none" stroke="#10b981" stroke-width="3.8" stroke-linecap="round" stroke-linejoin="round" /></svg>`;
+
 function render() {
   if (state.mode === "setup") return renderSetup();
   if (state.mode === "closed") return renderClosed();
@@ -399,7 +401,7 @@ function render() {
   view.innerHTML = `
     <header class="appbar">
       <div class="appbar-row">
-        <h1><img class="brand" src="/logo.svg" alt="" width="30" height="30" />周末作业打卡</h1>
+        <h1>${BRAND_SVG}周末作业打卡</h1>
         <div class="who">
           ${esc(state.user.displayName)} · ${ROLE_TEXT[state.user.role]}<br />
           <button class="link small" data-act="refresh">刷新</button>
@@ -877,7 +879,7 @@ function renderLogin() {
   view.innerHTML = `
     <div class="login">
       <div class="card">
-        <h1><img class="brand" src="/logo.svg" alt="" width="34" height="34" />周末作业打卡</h1>
+        <h1>${BRAND_SVG}周末作业打卡</h1>
         <div class="small muted" style="margin-bottom:14px">学生点完成，家长确认，周末结算积分。</div>
         ${state.error ? `<div class="notice error">${esc(state.error)}</div>` : ""}
         <form data-form="login">

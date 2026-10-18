@@ -1,5 +1,9 @@
 # 更新记录
 
+## 1.9.2
+
+- 页头和登录页的 logo 从 `<img src="/logo.svg">` 改成内联 SVG。静态资源是 `max-age=0, must-revalidate`，每换一次视图都要重新校验一次，弱网下 logo 位置会先空出一个灰方块（真机上刷新后能看到约 0.2–0.5 秒）。内联后不发请求、跟随页头一起渲染，`public/logo.svg` 和 PNG 继续给 favicon、「添加到主屏幕」用。
+
 ## 1.9.1
 
 - 新增站点 logo：蓝绿渐变 + 白卡片 + 绿勾（`public/logo.svg`），用在页头、登录页、favicon、iOS 桌面图标（`apple-touch-icon.png`）和 PWA 图标（`icon-192.png` / `icon-512.png`）；顺带补了 `site.webmanifest`，手机浏览器可以「添加到主屏幕」。

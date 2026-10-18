@@ -15,6 +15,12 @@ const state = {
   addTask: false,
   optionType: "homework",
   scheduleOpen: false,
+  audit: [],
+  auditMore: false,
+  auditBefore: null,
+  auditAction: "",
+  auditActor: "",
+  auditQ: "",
   error: "",
   notice: "",
   busy: false
@@ -382,6 +388,77 @@ function detailTotal(detail) {
   return Math.max(0, sum + (Number(detail.bonus) || 0) - (Number(detail.deduction) || 0));
 }
 
+const AUDIT_LABEL = {
+  "setup.init": "初始化管理员",
+  "auth.login": "登录",
+  "auth.login_failed": "登录失败",
+  "auth.logout": "退出登录",
+  "task.add": "加作业",
+  "task.update": "改作业",
+  "task.delete": "删作业",
+  "task.done": "打卡完成",
+  "task.confirm": "家长确认",
+  "task.complete": "家长代办完成",
+  "task.reopen": "撤销",
+  "task.confirm_all": "一键确认",
+  "option.add": "加选项",
+  "option.update": "改选项",
+  "option.delete": "删选项",
+  "bonus.add": "加扣分",
+  "bonus.delete": "删加扣分",
+  "settle.save": "结算",
+  "settle.clear": "撤销结算",
+  "rate.save": "改折现比例",
+  "schedule.save": "改本周时间",
+  "schedule.clear": "清空本周时间",
+  "redemption.request": "申请兑换",
+  "redemption.decide": "审批兑换",
+  "redemption.delete": "删兑换记录",
+  "user.add": "建账号",
+  "user.update": "改账号",
+  "settings.save": "改备份设置",
+  "backup.run": "手动备份",
+  "export.json": "导出数据",
+  "reset.all": "一键初始化"
+};
+
+const AUDIT_CATS = [
+  ["", "全部"],
+  ["task.", "作业"],
+  ["bonus.,settle.,rate.", "分数结算"],
+  ["redemption.", "兑换"],
+  ["option.", "选项库"],
+  ["user.,auth.", "账号"],
+  ["settings.,backup.,export.,reset.,schedule.,setup.", "设置"]
+];
+
+function fmtAuditTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const shifted = new Date(date.getTime() + 8 * 3600 * 1000);
+  const today = new Date(Date.now() + 8 * 3600 * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  const clock = `${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+  const day = shifted.toISOString().slice(0, 10);
+  if (day === today.toISOString().slice(0, 10)) return `今天 ${clock}`;
+  if (day === new Date(today.getTime() - 86400000).toISOString().slice(0, 10)) return `昨天 ${clock}`;
+  return `${shifted.getUTCMonth() + 1}-${pad(shifted.getUTCDate())} ${clock}`;
+}
+
+async function loadAudit(reset = true) {
+  if (!can("admin")) return;
+  const params = new URLSearchParams();
+  params.set("limit", "40");
+  if (state.auditAction) params.set("action", state.auditAction);
+  if (state.auditActor) params.set("actor", state.auditActor);
+  if (state.auditQ) params.set("q", state.auditQ);
+  if (!reset && state.auditBefore) params.set("before", String(state.auditBefore));
+  const data = await api(`/api/audit?${params.toString()}`);
+  state.audit = reset ? data.entries : [...state.audit, ...data.entries];
+  state.auditMore = Boolean(data.hasMore);
+  state.auditBefore = data.nextBefore;
+}
+
 const BRAND_SVG = `<svg class="brand" viewBox="0 0 48 48" aria-hidden="true" focusable="false"><defs><linearGradient id="whLogoBg" x1="0" y1="0" x2="48" y2="48" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#2563eb" /><stop offset="1" stop-color="#06b6d4" /></linearGradient></defs><rect width="48" height="48" fill="url(#whLogoBg)" /><rect x="9.5" y="8" width="29" height="32" rx="7" fill="#ffffff" /><rect x="15" y="14.5" width="18" height="2.8" rx="1.4" fill="#cbd5e1" /><rect x="15" y="21" width="12" height="2.8" rx="1.4" fill="#cbd5e1" /><path d="M15.5 30.2l4.6 4.6 9.6-10.2" fill="none" stroke="#10b981" stroke-width="3.8" stroke-linecap="round" stroke-linejoin="round" /></svg>`;
 
 function render() {
@@ -395,8 +472,9 @@ function render() {
   ];
   if (can("parent")) tabs.push(["settle", "结算"]);
   tabs.push(["account", "账户"]);
-  tabs.push(["options", "选项库"]);
-  if (can("admin")) tabs.push(["admin", "设置"]);
+  // 学生屏只留作业、奖励、账户；选项库、日志、设置是家长和管理员的活儿。
+  if (can("parent")) tabs.push(["options", "选项库"]);
+  if (can("admin")) tabs.push(["log", "日志"], ["admin", "设置"]);
 
   view.innerHTML = `
     <header class="appbar">
@@ -406,8 +484,8 @@ function render() {
           ${esc(state.user.displayName)} · ${ROLE_TEXT[state.user.role]}<br />
           <button class="link small" data-act="refresh">刷新</button>
           <button class="link small" data-act="logout">退出</button>
-          <span class="small">v${esc(state.version)}</span>
-          ${state.loadedAt ? `<br /><span class="small muted">更新于 ${fmtClock(state.loadedAt)}</span>` : ""}
+          ${can("parent") ? `<span class="small">v${esc(state.version)}</span>` : ""}
+          ${can("parent") && state.loadedAt ? `<br /><span class="small muted">更新于 ${fmtClock(state.loadedAt)}</span>` : ""}
         </div>
       </div>
       <nav class="tabs">
@@ -417,6 +495,9 @@ function render() {
     ${banner()}
     ${renderTab()}
   `;
+  // 手机窄屏时 tab 会横向滚动，切到靠后的页签（日志/设置）要保证它露出来。
+  const activeTab = view.querySelector('.tabs button[aria-current="true"]');
+  if (activeTab?.parentElement) activeTab.parentElement.scrollLeft = Math.max(0, activeTab.offsetLeft - 8);
 }
 
 function banner() {
@@ -438,6 +519,8 @@ function renderTab() {
       return renderOptions();
     case "admin":
       return renderAdmin();
+    case "log":
+      return renderLog();
     default:
       return renderTasks();
   }
@@ -478,6 +561,8 @@ function renderTasks() {
       </div>
       <div class="bar" style="margin-top:10px"><i style="width:${percent}%"></i></div>
       <div class="small muted" style="margin-top:6px">${cheerText(summary)}</div>
+      ${state.week.streak >= 2 ? `<div class="small streak" style="margin-top:6px">🔥 连续 ${state.week.streak} 周达标，状态在线</div>` : ""}
+      ${can("parent") || !rewardNudge() ? "" : `<div class="small muted" style="margin-top:6px">${rewardNudge()}</div>`}
       ${timeSummary() ? `<div style="margin-top:10px">${timeSummary()}</div>` : ""}
     </div>
     <div class="card">
@@ -621,7 +706,7 @@ function renderRewards() {
         </div>
         <button class="primary tiny" data-act="redeem" data-id="${option.id}" data-points="${option.points ?? ""}" data-title="${esc(option.title)}">申请兑换</button>
       </div>
-    `).join("") || '<div class="card muted">还没有奖励，去「选项库」里加。</div>'}
+    `).join("") || `<div class="card muted">还没有奖励，${can("parent") ? "去「选项库」里加" : "让家长在「选项库」里加一条"}。</div>`}
     <form class="card" data-form="redeem-custom">
       <strong>自定义兑换</strong>
       <div class="grid2" style="margin-top:9px">
@@ -800,6 +885,45 @@ function renderOptions() {
         </div>
       `).join("") || '<div class="item muted">还没有选项</div>'}
     </div>
+  `;
+}
+
+function renderLog() {
+  const actorOptions = state.users.filter((user) => user.role !== "student");
+  const chips = AUDIT_CATS.map(([value, label]) => `<button class="tiny${state.auditAction === value ? " on" : ""}" data-act="audit-cat" data-action="${value}">${label}</button>`).join("");
+  const rows = state.audit.map((entry) => `
+        <div class="item">
+          <div class="grow">
+            <strong>${esc(AUDIT_LABEL[entry.action] || entry.action)}</strong>${entry.target ? ` ${esc(entry.target)}` : ""}
+            <div class="small muted">${entry.detail ? `${esc(entry.detail)} · ` : ""}${fmtAuditTime(entry.at)}${entry.ip ? ` · ${esc(entry.ip)}` : ""}</div>
+          </div>
+          <div class="small muted" style="text-align:right;min-width:64px">
+            ${esc(entry.actorName || "系统")}<br />
+            ${entry.actorRole ? `<span class="tag">${esc(ROLE_TEXT[entry.actorRole] || entry.actorRole)}</span>` : ""}
+          </div>
+        </div>
+      `).join("");
+  return `
+    <div class="card plain">
+      <div class="row between">
+        <strong>操作日志</strong>
+        <div class="row" style="gap:6px">
+          <button class="tiny" data-act="audit-refresh">刷新</button>
+          <button class="tiny" data-act="audit-more" ${state.auditMore ? "" : "disabled"}>更早</button>
+        </div>
+      </div>
+      <div class="chips" style="margin-top:8px">${chips}</div>
+      <form class="row" data-form="audit-search" style="margin-top:8px;gap:6px">
+        <input name="q" value="${esc(state.auditQ)}" placeholder="搜名字、作业、备注" style="flex:1" maxlength="40" />
+        <select name="actor" style="width:auto">
+          <option value="">全部人</option>
+          ${actorOptions.map((user) => `<option value="${user.id}" ${String(state.auditActor) === String(user.id) ? "selected" : ""}>${esc(user.displayName)}</option>`).join("")}
+        </select>
+        <button class="tiny" type="submit">查</button>
+      </form>
+      <div class="small muted" style="margin-top:6px">保留最近 400 天，已加载 ${state.audit.length} 条${state.auditMore ? "，点「更早」继续" : ""}</div>
+    </div>
+    <div class="list">${rows || '<div class="item muted">还没有日志</div>'}</div>
   `;
 }
 
@@ -1056,6 +1180,14 @@ document.addEventListener("submit", (event) => {
     });
   }
 
+  if (name === "audit-search") {
+    run(async () => {
+      state.auditQ = String(data.q || "").trim();
+      state.auditActor = data.actor || "";
+      await loadAudit(true);
+    });
+  }
+
   if (name === "option-add") {
     run(async () => {
       await api("/api/options", {
@@ -1151,7 +1283,19 @@ document.addEventListener("click", (event) => {
       state.error = "";
       state.notice = "";
       render();
+      if (state.tab === "log") run(async () => { await loadAudit(true); });
     },
+    "audit-refresh": () => run(async () => {
+      await loadAudit(true);
+      setNotice("日志已刷新");
+    }),
+    "audit-more": () => run(async () => {
+      await loadAudit(false);
+    }),
+    "audit-cat": () => run(async () => {
+      state.auditAction = trigger.dataset.action;
+      await loadAudit(true);
+    }),
     "option-type": () => {
       state.optionType = trigger.dataset.type;
       render();

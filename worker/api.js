@@ -5,6 +5,7 @@ import {
   createSession,
   createUser,
   currentUser,
+  ROLE_LABEL,
   destroySession,
   publicUser,
   setPassword,
@@ -31,9 +32,40 @@ import {
 } from "./scoring.js";
 import { beijingYear, deriveScheduleFromRange, holidayScheduleForWeek, loadHolidayPeriods } from "./holidays.js";
 import { bool, constantTimeEqual, fail, integer, json, nowIso, optionalText, readJson, text } from "./util.js";
+import { actionPrefixes, logAudit, mapAuditRow } from "./audit.js";
 
 const ROUTES = [];
 const SETTLE_RATE_KEY = "settle_rate";
+const TASK_FIELD_LABEL = {
+  title: "标题",
+  subject: "科目",
+  est_minutes: "预估分钟",
+  plan_slot: "计划时段",
+  note: "备注",
+  quality: "质量分",
+  actual_minutes: "实际分钟",
+  sort_order: "顺序"
+};
+const OPTION_FIELD_LABEL = {
+  title: "名称",
+  subject: "科目",
+  est_minutes: "预估分钟",
+  points: "积分",
+  sort_order: "顺序",
+  weekly: "每周固定",
+  active: "启用",
+  description: "备注"
+};
+const OPTION_TYPE_LABEL = { homework: "常用作业", reward: "奖励", bonus: "加分项", deduction: "扣分项" };
+const SETTING_FIELD_LABEL = {
+  webdav_url: "地址",
+  webdav_username: "用户名",
+  webdav_path: "目录",
+  webdav_keep: "保留份数",
+  webdav_enabled: "启用状态",
+  webdav_password: "密码"
+};
+const fieldList = (fields, labels) => fields.map((item) => labels[item.replace(" = ?", "")] || item.replace(" = ?", "")).join(", ");
 
 function route(method, pattern, minRole, handler) {
   ROUTES.push({ method, pattern, minRole, handler });
@@ -261,6 +293,22 @@ async function accountOf(db) {
   return { earned: earnedTotal, spent: spentTotal, pending: Number(pending?.total) || 0, balance: earnedTotal - spentTotal };
 }
 
+// 连续达标周数：从最近一周往前数，完成率 ≥ 90% 算达标，放假没留作业的空周不断档。
+async function streakOf(db, weekKey) {
+  const rows = await db
+    .prepare("SELECT week_key, COUNT(*) AS total, SUM(CASE WHEN status = 'confirmed' THEN 1 ELSE 0 END) AS confirmed FROM tasks WHERE week_key < ? GROUP BY week_key ORDER BY week_key DESC LIMIT 24")
+    .bind(weekKey)
+    .all();
+  let streak = 0;
+  for (const row of rows.results) {
+    const total = Number(row.total) || 0;
+    if (!total) continue;
+    if ((Number(row.confirmed) || 0) / total >= 0.9) streak += 1;
+    else break;
+  }
+  return streak;
+}
+
 async function readSettleRate(db) {
   const row = await db.prepare("SELECT value FROM settings WHERE key = ?").bind(SETTLE_RATE_KEY).first();
   const rate = Number(row?.value);
@@ -291,6 +339,7 @@ async function weekPayload(env, weekKey) {
       ? { detail: JSON.parse(data.score.detail), total: data.score.total, settledAt: data.score.settled_at, note: data.score.note, rate: data.score.settle_rate ?? null }
       : null,
     auto,
+    streak: await streakOf(env.DB, weekKey),
     summary: {
       total: data.tasks.length,
       done: data.tasks.filter((task) => task.status === "done").length,
@@ -324,6 +373,7 @@ route("POST", /^\/api\/setup$/, null, async ({ env, request }) => {
   await createUser(env.DB, { username, displayName, role: "admin", password });
   const user = await verifyCredentials(env.DB, username, password);
   const token = await createSession(env.DB, user.id);
+  await logAudit(env.DB, { user, action: "setup.init", target: `@${username}`, detail: `初始化管理员 ${displayName}`, request });
   return json({ user: publicUser(user) }, 200, { "Set-Cookie": sessionCookie(token, cookieOptions(request)) });
 });
 
@@ -334,13 +384,20 @@ route("POST", /^\/api\/login$/, null, async ({ env, request }) => {
   const { password } = parsed.body;
   if (!username || typeof password !== "string") return fail("invalid_credentials", 401);
   const user = await verifyCredentials(env.DB, username.toLowerCase(), password);
-  if (!user) return fail("invalid_credentials", 401);
+  if (!user) {
+    // 只记真实账号的失败尝试，避免陌生用户名把日志刷爆。
+    const known = await env.DB.prepare("SELECT id, display_name, role FROM users WHERE username = ?").bind(username.toLowerCase()).first();
+    if (known) await logAudit(env.DB, { user: known, action: "auth.login_failed", target: `@${known.display_name}`, detail: "密码不对", request });
+    return fail("invalid_credentials", 401);
+  }
+  await logAudit(env.DB, { user, action: "auth.login", request });
   const token = await createSession(env.DB, user.id);
   return json({ user: publicUser(user), weekKey: weekKeyOf() }, 200, { "Set-Cookie": sessionCookie(token, cookieOptions(request)) });
 });
 
-route("POST", /^\/api\/logout$/, "student", async ({ env, request }) => {
+route("POST", /^\/api\/logout$/, "student", async ({ env, user, request }) => {
   await destroySession(env.DB, request);
+  await logAudit(env.DB, { user, action: "auth.logout", request });
   return json({ ok: true }, 200, { "Set-Cookie": clearCookie(cookieOptions(request)) });
 });
 
@@ -407,6 +464,7 @@ route("POST", /^\/api\/tasks$/, "student", async ({ env, user, request }) => {
     }
   }
   if (bool(body.saveAsOption)) await saveOption(env, user, { type: "homework", title, subject: body.subject, estMinutes: body.estMinutes });
+  await logAudit(env.DB, { user, action: "task.add", target: title, weekKey, detail: [title, optionalText(body.subject, 20)].filter(Boolean).join(" · "), request });
   return json({ ok: true, week: await weekPayload(env, weekKey) });
 });
 
@@ -442,14 +500,16 @@ route("PATCH", /^\/api\/tasks\/(\d+)$/, "student", async ({ env, user, request, 
   if (!fields.length) return fail("nothing_to_update", 400);
   values.push(id);
   await env.DB.prepare(`UPDATE tasks SET ${fields.join(", ")} WHERE id = ?`).bind(...values).run();
+  await logAudit(env.DB, { user, action: "task.update", target: task.title, weekKey: task.week_key, detail: fieldList(fields, TASK_FIELD_LABEL), request });
   return json({ ok: true, week: await weekPayload(env, task.week_key) });
 });
 
-route("DELETE", /^\/api\/tasks\/(\d+)$/, "parent", async ({ env, params }) => {
+route("DELETE", /^\/api\/tasks\/(\d+)$/, "parent", async ({ env, user, request, params }) => {
   const id = Number(params[0]);
-  const task = await env.DB.prepare("SELECT week_key FROM tasks WHERE id = ?").bind(id).first();
+  const task = await env.DB.prepare("SELECT * FROM tasks WHERE id = ?").bind(id).first();
   if (!task) return fail("not_found", 404);
   await env.DB.prepare("DELETE FROM tasks WHERE id = ?").bind(id).run();
+  await logAudit(env.DB, { user, action: "task.delete", target: task.title, weekKey: task.week_key, request });
   return json({ ok: true, week: await weekPayload(env, task.week_key) });
 });
 
@@ -461,13 +521,15 @@ route("POST", /^\/api\/tasks\/(\d+)\/done$/, "student", async ({ env, user, requ
   const parsed = await readOptionalJson(request);
   if (parsed.response) return parsed.response;
   const actualMinutes = integer(parsed.body.actualMinutes, { min: 0, max: 600, fallback: task.actual_minutes ?? null });
+  const doneVia = atLeast(user, "parent") ? "parent" : "student";
   await env.DB.prepare("UPDATE tasks SET status = 'done', done_by = ?, done_at = ?, done_via = ?, actual_minutes = ? WHERE id = ?")
-    .bind(user.id, nowIso(), atLeast(user, "parent") ? "parent" : "student", actualMinutes, id)
+    .bind(user.id, nowIso(), doneVia, actualMinutes, id)
     .run();
+  await logAudit(env.DB, { user, action: "task.done", target: task.title, weekKey: task.week_key, detail: `${doneVia === "parent" ? "家长代办" : "学生打卡"}${actualMinutes === null ? "" : ` · 实际 ${actualMinutes} 分钟`}`, request });
   return json({ ok: true, week: await weekPayload(env, task.week_key) });
 });
 
-route("POST", /^\/api\/tasks\/(\d+)\/confirm$/, "parent", async ({ env, user, params }) => {
+route("POST", /^\/api\/tasks\/(\d+)\/confirm$/, "parent", async ({ env, user, request, params }) => {
   const id = Number(params[0]);
   const task = await env.DB.prepare("SELECT * FROM tasks WHERE id = ?").bind(id).first();
   if (!task) return fail("not_found", 404);
@@ -475,6 +537,7 @@ route("POST", /^\/api\/tasks\/(\d+)\/confirm$/, "parent", async ({ env, user, pa
   await env.DB.prepare("UPDATE tasks SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? WHERE id = ?")
     .bind(user.id, nowIso(), id)
     .run();
+  await logAudit(env.DB, { user, action: "task.confirm", target: task.title, weekKey: task.week_key, request });
   return json({ ok: true, week: await weekPayload(env, task.week_key) });
 });
 
@@ -491,10 +554,11 @@ route("POST", /^\/api\/tasks\/(\d+)\/complete$/, "parent", async ({ env, user, r
   )
     .bind(user.id, at, user.id, at, actualMinutes, id)
     .run();
+  await logAudit(env.DB, { user, action: "task.complete", target: task.title, weekKey: task.week_key, request });
   return json({ ok: true, week: await weekPayload(env, task.week_key) });
 });
 
-route("POST", /^\/api\/tasks\/(\d+)\/reopen$/, "parent", async ({ env, params }) => {
+route("POST", /^\/api\/tasks\/(\d+)\/reopen$/, "parent", async ({ env, user, request, params }) => {
   const id = Number(params[0]);
   const task = await env.DB.prepare("SELECT * FROM tasks WHERE id = ?").bind(id).first();
   if (!task) return fail("not_found", 404);
@@ -503,6 +567,7 @@ route("POST", /^\/api\/tasks\/(\d+)\/reopen$/, "parent", async ({ env, params })
   )
     .bind(id)
     .run();
+  await logAudit(env.DB, { user, action: "task.reopen", target: task.title, weekKey: task.week_key, detail: task.status === "confirmed" ? "撤销确认" : "撤销完成", request });
   return json({ ok: true, week: await weekPayload(env, task.week_key) });
 });
 
@@ -510,9 +575,10 @@ route("POST", /^\/api\/tasks\/confirm-done$/, "parent", async ({ env, user, requ
   const parsed = await readJson(request);
   if (parsed.response) return parsed.response;
   const weekKey = canonicalWeekKey(parsed.body.weekKey) || weekKeyOf();
-  await env.DB.prepare("UPDATE tasks SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? WHERE week_key = ? AND status = 'done'")
+  const result = await env.DB.prepare("UPDATE tasks SET status = 'confirmed', confirmed_by = ?, confirmed_at = ? WHERE week_key = ? AND status = 'done'")
     .bind(user.id, nowIso(), weekKey)
     .run();
+  await logAudit(env.DB, { user, action: "task.confirm_all", weekKey, detail: `一键确认 ${Number(result?.meta?.changes) || 0} 条`, request });
   return json({ ok: true, week: await weekPayload(env, weekKey) });
 });
 
@@ -535,10 +601,11 @@ async function saveOption(env, user, body) {
       nowIso()
     )
     .run();
+  await logAudit(env.DB, { user, action: "option.add", target: title, detail: OPTION_TYPE_LABEL[type] });
   return true;
 }
 
-export { saveOption };
+export { saveOption, streakOf };
 
 route("GET", /^\/api\/options$/, "student", async ({ env, url }) => {
   const type = url.searchParams.get("type");
@@ -558,8 +625,10 @@ route("POST", /^\/api\/options$/, "student", async ({ env, user, request }) => {
   return json({ ok: true });
 });
 
-route("PATCH", /^\/api\/options\/(\d+)$/, "parent", async ({ env, request, params }) => {
+route("PATCH", /^\/api\/options\/(\d+)$/, "parent", async ({ env, user, request, params }) => {
   const id = Number(params[0]);
+  const option = await env.DB.prepare("SELECT title, type FROM options WHERE id = ?").bind(id).first();
+  if (!option) return fail("not_found", 404);
   const parsed = await readJson(request);
   if (parsed.response) return parsed.response;
   const body = parsed.body;
@@ -583,11 +652,16 @@ route("PATCH", /^\/api\/options\/(\d+)$/, "parent", async ({ env, request, param
   if (!fields.length) return fail("nothing_to_update", 400);
   values.push(id);
   await env.DB.prepare(`UPDATE options SET ${fields.join(", ")} WHERE id = ?`).bind(...values).run();
+  await logAudit(env.DB, { user, action: "option.update", target: option.title, detail: `${OPTION_TYPE_LABEL[option.type] || option.type} · ${fieldList(fields, OPTION_FIELD_LABEL)}`, request });
   return json({ ok: true });
 });
 
-route("DELETE", /^\/api\/options\/(\d+)$/, "parent", async ({ env, params }) => {
-  await env.DB.prepare("DELETE FROM options WHERE id = ?").bind(Number(params[0])).run();
+route("DELETE", /^\/api\/options\/(\d+)$/, "parent", async ({ env, user, request, params }) => {
+  const id = Number(params[0]);
+  const option = await env.DB.prepare("SELECT title, type FROM options WHERE id = ?").bind(id).first();
+  if (!option) return fail("not_found", 404);
+  await env.DB.prepare("DELETE FROM options WHERE id = ?").bind(id).run();
+  await logAudit(env.DB, { user, action: "option.delete", target: option.title, detail: OPTION_TYPE_LABEL[option.type] || option.type, request });
   return json({ ok: true });
 });
 
@@ -603,14 +677,16 @@ route("POST", /^\/api\/bonus$/, "parent", async ({ env, user, request }) => {
   await env.DB.prepare("INSERT INTO bonus_items (week_key, kind, title, points, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)")
     .bind(weekKey, kind, title, points, user.id, nowIso())
     .run();
+  await logAudit(env.DB, { user, action: "bonus.add", target: title, weekKey, detail: `${kind === "bonus" ? "加分" : "扣分"} ${points} 分`, request });
   return json({ ok: true, week: await weekPayload(env, weekKey) });
 });
 
-route("DELETE", /^\/api\/bonus\/(\d+)$/, "parent", async ({ env, params }) => {
+route("DELETE", /^\/api\/bonus\/(\d+)$/, "parent", async ({ env, user, request, params }) => {
   const id = Number(params[0]);
-  const item = await env.DB.prepare("SELECT week_key FROM bonus_items WHERE id = ?").bind(id).first();
+  const item = await env.DB.prepare("SELECT * FROM bonus_items WHERE id = ?").bind(id).first();
   if (!item) return fail("not_found", 404);
   await env.DB.prepare("DELETE FROM bonus_items WHERE id = ?").bind(id).run();
+  await logAudit(env.DB, { user, action: "bonus.delete", target: item.title, weekKey: item.week_key, detail: `${item.kind === "bonus" ? "加分" : "扣分"} ${item.points} 分`, request });
   return json({ ok: true, week: await weekPayload(env, item.week_key) });
 });
 
@@ -634,16 +710,18 @@ route("POST", /^\/api\/settle$/, "parent", async ({ env, user, request }) => {
   )
     .bind(weekKey, JSON.stringify(detail), total, user.id, nowIso(), optionalText(body.note, 300), rate)
     .run();
+  await logAudit(env.DB, { user, action: "settle.save", weekKey, detail: `本周总分 ${total}`, request });
   return json({ ok: true, total, detail, week: await weekPayload(env, weekKey) });
 });
 
-route("DELETE", /^\/api\/settle$/, "admin", async ({ env, url }) => {
+route("DELETE", /^\/api\/settle$/, "admin", async ({ env, user, request, url }) => {
   const weekKey = pickWeek(url);
   await env.DB.prepare("DELETE FROM week_scores WHERE week_key = ?").bind(weekKey).run();
+  await logAudit(env.DB, { user, action: "settle.clear", weekKey, request });
   return json({ ok: true, week: await weekPayload(env, weekKey) });
 });
 
-route("PUT", /^\/api\/rate$/, "parent", async ({ env, request }) => {
+route("PUT", /^\/api\/rate$/, "parent", async ({ env, user, request }) => {
   const parsed = await readJson(request);
   if (parsed.response) return parsed.response;
   const rate = Number(parsed.body.rate);
@@ -655,6 +733,7 @@ route("PUT", /^\/api\/rate$/, "parent", async ({ env, request }) => {
   )
     .bind(SETTLE_RATE_KEY, value, nowIso())
     .run();
+  await logAudit(env.DB, { user, action: "rate.save", detail: rate > 0 ? `1 积分 = ${value} 元` : "关闭折现", request });
   return json({ ok: true, rate: Number(value) });
 });
 
@@ -720,6 +799,7 @@ route("PUT", /^\/api\/schedule$/, "parent", async ({ env, user, request }) => {
   const hasCustom = Boolean(rangeStart || note || checklist.value !== null || early.value !== null || mid.value !== null || hard.value !== null || weekEndOverride.value !== null);
   if (!hasCustom) {
     await env.DB.prepare("DELETE FROM week_schedules WHERE week_key = ?").bind(weekKey).run();
+    await logAudit(env.DB, { user, action: "schedule.clear", weekKey, detail: "回到默认 / 自动时间", request });
     const plan = await weekPlanForResponse(env.DB, weekKey);
     return json({
       ok: true,
@@ -759,6 +839,7 @@ route("PUT", /^\/api\/schedule$/, "parent", async ({ env, user, request }) => {
       nowIso()
     )
     .run();
+  await logAudit(env.DB, { user, action: "schedule.save", weekKey, detail: `${rangeStart ? `放假 ${rangeStart} ~ ${rangeEnd}` : "自定义时间"}${note ? ` · ${note}` : ""}`, request });
   const plan = await weekPlanForResponse(env.DB, weekKey);
   return json({
     ok: true,
@@ -790,6 +871,7 @@ route("POST", /^\/api\/redemptions$/, "student", async ({ env, user, request }) 
   await env.DB.prepare("INSERT INTO redemptions (week_key, title, points, status, requested_by, requested_at, note) VALUES (?, ?, ?, 'pending', ?, ?, ?)")
     .bind(weekKey, title, points, user.id, nowIso(), optionalText(body.note, 200))
     .run();
+  await logAudit(env.DB, { user, action: "redemption.request", target: title, weekKey, detail: `申请 ${points} 分`, request });
   return json({ ok: true, week: await weekPayload(env, weekKey) });
 });
 
@@ -810,14 +892,16 @@ route("POST", /^\/api\/redemptions\/(\d+)\/decide$/, "parent", async ({ env, use
   await env.DB.prepare("UPDATE redemptions SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?")
     .bind(status, user.id, nowIso(), id)
     .run();
+  await logAudit(env.DB, { user, action: "redemption.decide", target: row.title, weekKey: row.week_key, detail: `${status === "approved" ? "批准" : "驳回"} ${row.points} 分`, request });
   return json({ ok: true, week: await weekPayload(env, row.week_key) });
 });
 
-route("DELETE", /^\/api\/redemptions\/(\d+)$/, "admin", async ({ env, params }) => {
+route("DELETE", /^\/api\/redemptions\/(\d+)$/, "admin", async ({ env, user, request, params }) => {
   const id = Number(params[0]);
-  const row = await env.DB.prepare("SELECT week_key FROM redemptions WHERE id = ?").bind(id).first();
+  const row = await env.DB.prepare("SELECT * FROM redemptions WHERE id = ?").bind(id).first();
   if (!row) return fail("not_found", 404);
   await env.DB.prepare("DELETE FROM redemptions WHERE id = ?").bind(id).run();
+  await logAudit(env.DB, { user, action: "redemption.delete", target: row.title, weekKey: row.week_key, request });
   return json({ ok: true, week: await weekPayload(env, row.week_key) });
 });
 
@@ -837,7 +921,7 @@ route("GET", /^\/api\/users$/, "admin", async ({ env }) => {
   return json({ users: rows.results.map(mapUser) });
 });
 
-route("POST", /^\/api\/users$/, "admin", async ({ env, request }) => {
+route("POST", /^\/api\/users$/, "admin", async ({ env, user, request }) => {
   const parsed = await readJson(request);
   if (parsed.response) return parsed.response;
   const body = parsed.body;
@@ -850,6 +934,7 @@ route("POST", /^\/api\/users$/, "admin", async ({ env, request }) => {
   const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(username).first();
   if (existing) return fail("username_taken", 409);
   await createUser(env.DB, { username, displayName, role, password: body.password });
+  await logAudit(env.DB, { user, action: "user.add", target: `@${username}`, detail: `${displayName} · ${ROLE_LABEL[role]}`, request });
   return json({ ok: true });
 });
 
@@ -893,6 +978,18 @@ route("PATCH", /^\/api\/users\/(\d+)$/, "admin", async ({ env, user, request, pa
     await setPassword(env.DB, id, body.password);
     await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
   }
+  await logAudit(env.DB, {
+    user,
+    action: "user.update",
+    target: `@${target.username}`,
+    detail: [
+      body.displayName !== undefined ? `改名叫 ${text(body.displayName, 40)}` : "",
+      body.role !== undefined && nextRole !== target.role ? `角色 → ${ROLE_LABEL[nextRole]}` : "",
+      body.active !== undefined && nextActive !== Boolean(target.active) ? (nextActive ? "启用" : "停用") : "",
+      body.password !== undefined ? "重置密码" : ""
+    ].filter(Boolean).join(" · "),
+    request
+  });
   return json({ ok: true });
 });
 
@@ -912,7 +1009,7 @@ route("GET", /^\/api\/settings$/, "admin", async ({ env }) => {
   });
 });
 
-route("PUT", /^\/api\/settings$/, "admin", async ({ env, request }) => {
+route("PUT", /^\/api\/settings$/, "admin", async ({ env, user, request }) => {
   const parsed = await readJson(request);
   if (parsed.response) return parsed.response;
   const body = parsed.body;
@@ -928,14 +1025,17 @@ route("PUT", /^\/api\/settings$/, "admin", async ({ env, request }) => {
   if (body.enabled !== undefined) patch.webdav_enabled = bool(body.enabled) ? "1" : "0";
   if (typeof body.password === "string") patch.webdav_password = body.password;
   await saveSettings(env.DB, patch);
+  await logAudit(env.DB, { user, action: "settings.save", detail: Object.keys(patch).map((key) => SETTING_FIELD_LABEL[key] || key).join(", "), request });
   return json({ ok: true });
 });
 
-route("POST", /^\/api\/backup\/run$/, "admin", async ({ env }) => {
-  return json(await runBackup(env, { trigger: "manual" }));
+route("POST", /^\/api\/backup\/run$/, "admin", async ({ env, user, request }) => {
+  const result = await runBackup(env, { trigger: "manual" });
+  await logAudit(env.DB, { user, action: "backup.run", detail: `${result?.ok ? "成功" : "失败"}${result?.message ? ` · ${result.message}` : ""}`, request });
+  return json(result);
 });
 
-route("POST", /^\/api\/reset$/, "admin", async ({ env, request }) => {
+route("POST", /^\/api\/reset$/, "admin", async ({ env, user, request }) => {
   const parsed = await readJson(request);
   if (parsed.response) return parsed.response;
   if (parsed.body.confirm !== "初始化") return fail("invalid_confirm", 400);
@@ -945,6 +1045,7 @@ route("POST", /^\/api\/reset$/, "admin", async ({ env, request }) => {
     env.DB.prepare("DELETE FROM week_scores"),
     env.DB.prepare("DELETE FROM redemptions")
   ]);
+  await logAudit(env.DB, { user, action: "reset.all", detail: "清空作业与分数", request });
   return json({ ok: true });
 });
 
@@ -953,7 +1054,45 @@ route("GET", /^\/api\/backup\/log$/, "admin", async ({ env, url }) => {
   return json({ log: await backupLog(env.DB, limit) });
 });
 
-route("GET", /^\/api\/export$/, "admin", async ({ env }) => {
+route("GET", /^\/api\/audit$/, "admin", async ({ env, url }) => {
+  const limit = integer(url.searchParams.get("limit"), { min: 1, max: 200, fallback: 50 });
+  const before = integer(url.searchParams.get("before"), { min: 1, fallback: null });
+  const actor = integer(url.searchParams.get("actor"), { min: 1, fallback: null });
+  const week = canonicalWeekKey(url.searchParams.get("week"));
+  const prefixes = actionPrefixes(url.searchParams.get("action"));
+  const keyword = optionalText(url.searchParams.get("q"), 40);
+  const where = [];
+  const binds = [];
+  if (before !== null) {
+    where.push("id < ?");
+    binds.push(before);
+  }
+  if (actor !== null) {
+    where.push("actor_id = ?");
+    binds.push(actor);
+  }
+  if (week) {
+    where.push("week_key = ?");
+    binds.push(week);
+  }
+  if (prefixes.length) {
+    where.push(`(${prefixes.map(() => "action LIKE ?").join(" OR ")})`);
+    binds.push(...prefixes.map((item) => `${item}%`));
+  }
+  if (keyword) {
+    where.push("(COALESCE(detail, '') LIKE ? OR COALESCE(target, '') LIKE ? OR COALESCE(actor_name, '') LIKE ?)");
+    binds.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`);
+  }
+  const sql = `SELECT * FROM audit_log ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`;
+  const rows = await env.DB.prepare(sql).bind(...binds, limit + 1).all();
+  const list = rows.results.map(mapAuditRow);
+  const hasMore = list.length > limit;
+  const entries = hasMore ? list.slice(0, limit) : list;
+  return json({ entries, hasMore, nextBefore: entries.length ? entries[entries.length - 1].id : null });
+});
+
+route("GET", /^\/api\/export$/, "admin", async ({ env, user, request }) => {
+  await logAudit(env.DB, { user, action: "export.json", request });
   const payload = JSON.stringify(await dumpAll(env.DB), null, 2);
   return new Response(payload, {
     headers: {

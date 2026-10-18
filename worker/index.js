@@ -1,5 +1,6 @@
 import { handleApi } from "./api.js";
 import { cleanupSessions } from "./auth.js";
+import { pruneAuditLog } from "./audit.js";
 import { runBackup } from "./backup.js";
 import { fail } from "./util.js";
 
@@ -28,6 +29,7 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(cleanupSessions(env.DB));
+    ctx.waitUntil(pruneAuditLog(env.DB));
     ctx.waitUntil(runBackup(env, { trigger: "cron" }));
   }
 };

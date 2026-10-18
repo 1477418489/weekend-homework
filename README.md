@@ -162,6 +162,7 @@ npm test        # 跑计分、节假日、操作日志、连胜等单元测试�
 - 密码用 PBKDF2-SHA256（10 万次迭代）+ 随机盐存储，会话表按过期时间自动清理。
 - 写操作写入 `audit_log`（保留 400 天，Cron 里顺带清理），管理员在「日志」页查看；只记密码输错的失败登录、不记密码明文，日志里带操作 IP。
 - 页面响应带 CSP、`X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff` 等安全头。
+- 静态资源带版本号：Worker 返回 `index.html` 时把 `/style.css`、`/app.js` 的引用重写成 `?v=<APP_VERSION>`（`worker/index.js` 的 `injectAssetVersions`）。带对版本号的请求返回 `public, max-age=604800, immutable`，浏览器 7 天不用重新校验；页面本体仍是 `max-age=0, must-revalidate`，发版即生效；版本号不带或对不上的请求维持原样。
 - 注意：WebDAV 密码存在 `settings` 表里，管理员可见；想更稳妥就用 `wrangler secret put WEBDAV_PASSWORD`。
 - 非 HTTPS 访问时 Cookie 不加 `Secure`（方便局域网和本地调试），生产环境是 HTTPS，会正常加上。
 - 节假日数据是公开只读数据源（GitHub），只读不写；取不到不影响任何已有功能。

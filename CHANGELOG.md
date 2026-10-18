@@ -1,5 +1,10 @@
 # 更新记录
 
+## 1.11.0
+
+- 弱网打开更快：首页里 `/style.css`、`/app.js` 的引用由 Worker 注入版本号（`?v=<APP_VERSION>`），带对版本号的静态资源返回 `Cache-Control: public, max-age=604800, immutable`。家里人第二次打开直接吃浏览器本地缓存，不用再为 CSS/JS 各跑一趟校验往返；`index.html` 仍是 `max-age=0, must-revalidate`，发新版本立即生效。
+- 版本号不带或对不上的请求保持原来的 `max-age=0, must-revalidate`，老页面不会拿到错版本；Worker 没配 `APP_VERSION` 时按原样输出，不影响本地调试。重写和缓存判定抽成 `assetCacheControl` / `injectAssetVersions`（`worker/index.js`），新增 `test/assets.test.js`（4 条）。
+
 ## 1.10.1
 
 - 补上 iOS「添加到主屏幕」需要的 meta（`apple-mobile-web-app-capable` 等），装到桌面后全屏打开、没有地址栏，标题显示「作业打卡」。

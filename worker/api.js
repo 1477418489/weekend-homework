@@ -29,6 +29,7 @@ import {
   weekKeyOf,
   weekLabel
 } from "./scoring.js";
+import { beijingYear, deriveScheduleFromRange, holidayScheduleForWeek, loadHolidayPeriods } from "./holidays.js";
 import { bool, constantTimeEqual, fail, integer, json, nowIso, optionalText, readJson, text } from "./util.js";
 
 const ROUTES = [];
@@ -162,17 +163,81 @@ async function loadSchedule(db, weekKey) {
   return mapSchedule(row);
 }
 
-// 默认的收工时间是周日 24:00。如果下一周被提前成节假日（比如从周三开始放假），
-// 这一周的收工时间跟着提前，免得拖到新一段假期里还要补上一周的作业。
-async function resolveDeadlines(db, weekKey) {
-  const [schedule, nextSchedule] = await Promise.all([
-    loadSchedule(db, weekKey),
-    loadSchedule(db, shiftWeek(weekKey, 1))
-  ]);
-  const deadlines = resolveWeekDeadlines(weekKey, schedule);
-  const nextStart = nextSchedule?.rangeStart ? Date.parse(`${nextSchedule.rangeStart}T00:00:00.000+08:00`) : NaN;
-  if (Number.isFinite(nextStart) && nextStart < deadlines.weekEnd) deadlines.weekEnd = nextStart;
-  return deadlines;
+function rangeMs(rangeStart, rangeEnd) {
+  if (!rangeStart || !rangeEnd) return null;
+  const start = Date.parse(`${rangeStart}T00:00:00.000+08:00`);
+  const end = Date.parse(`${rangeEnd}T00:00:00.000+08:00`);
+  return Number.isFinite(start) && Number.isFinite(end) ? { start, end } : null;
+}
+
+// 大多数周只需要查当年的数据，只有周五~周日正好压着元旦才多看一年。
+// cache 在一次请求内复用，避免一周查两遍。
+async function holidayPeriodsForWeek(db, weekKey, cache = new Map()) {
+  const start = weekStartMs(weekKey);
+  const windowEnd = start + 3 * 24 * 60 * 60 * 1000;
+  const years = new Set([beijingYear(start)]);
+  if (beijingYear(windowEnd) !== beijingYear(start)) years.add(beijingYear(windowEnd));
+  const lists = await Promise.all(
+    [...years].map(async (year) => {
+      if (!cache.has(year)) cache.set(year, await loadHolidayPeriods(db, year));
+      return cache.get(year);
+    })
+  );
+  return lists.filter(Boolean).flat();
+}
+
+// 一周的生效时间，优先级：家长手工设置 > 放假区间推算 > 默认周五到周日。
+// 放假区间可能是家长填的，也可能是节假日接口自动给的，推算规则在 holidays.js。
+async function weekPlan(db, weekKey, holidayCache = new Map()) {
+  const [row, periods] = await Promise.all([loadSchedule(db, weekKey), holidayPeriodsForWeek(db, weekKey, holidayCache)]);
+  const holiday = holidayScheduleForWeek(weekKey, periods);
+  const manualRange = rangeMs(row?.rangeStart, row?.rangeEnd);
+  const effectiveRange = manualRange || (holiday ? rangeMs(holiday.rangeStart, holiday.rangeEnd) : null);
+  const derived = effectiveRange ? deriveScheduleFromRange(weekKey, effectiveRange.start, effectiveRange.end) : null;
+  const overrides = {};
+  if (row) {
+    for (const key of Object.keys(SCHEDULE_COLUMNS)) {
+      if (Number.isFinite(Number(row[key]))) overrides[key] = Number(row[key]);
+    }
+  }
+  const custom = Boolean(row && (row.rangeStart || row.rangeEnd || Object.keys(overrides).length));
+  return {
+    deadlines: resolveWeekDeadlines(weekKey, { ...(derived || {}), ...overrides }),
+    rangeStart: manualRange ? row.rangeStart : holiday?.rangeStart || null,
+    rangeEnd: manualRange ? row.rangeEnd : holiday?.rangeEnd || null,
+    holiday: holiday ? { name: holiday.name, start: holiday.rangeStart, end: holiday.rangeEnd } : null,
+    note: row?.note || null,
+    custom,
+    source: custom ? "manual" : holiday ? "auto" : "default"
+  };
+}
+
+// 这一周的收工时间不能拖进下一周新开始的假期；同一个长假（放假开始日期相同）不缩。
+async function weekPlanForResponse(db, weekKey) {
+  const holidayCache = new Map();
+  const [plan, next] = await Promise.all([weekPlan(db, weekKey, holidayCache), weekPlan(db, shiftWeek(weekKey, 1), holidayCache)]);
+  const nextStart = next.rangeStart ? Date.parse(`${next.rangeStart}T00:00:00.000+08:00`) : NaN;
+  const sameRange = Boolean(plan.rangeStart) && next.rangeStart === plan.rangeStart;
+  if (Number.isFinite(nextStart) && !sameRange && nextStart < plan.deadlines.weekEnd) plan.deadlines.weekEnd = nextStart;
+  return plan;
+}
+
+function schedulePayload(plan) {
+  return {
+    source: plan.source,
+    custom: plan.custom,
+    rangeStart: plan.rangeStart,
+    rangeEnd: plan.rangeEnd,
+    holiday: plan.holiday,
+    note: plan.note,
+    deadlines: {
+      fridayChecklist: plan.deadlines.fridayChecklist,
+      saturdayEarly: plan.deadlines.saturdayEarly,
+      saturdayMid: plan.deadlines.saturdayMid,
+      saturdayHard: plan.deadlines.saturdayHard,
+      weekEnd: plan.deadlines.weekEnd
+    }
+  };
 }
 
 function timestampMs(value) {
@@ -204,30 +269,19 @@ async function readSettleRate(db) {
 
 async function weekPayload(env, weekKey) {
   const data = await loadWeek(env, weekKey);
-  const [rates, rate, schedule, deadlines] = await Promise.all([
+  const [rates, rate, plan] = await Promise.all([
     previousRates(env.DB, weekKey),
     readSettleRate(env.DB),
-    loadSchedule(env.DB, weekKey),
-    resolveDeadlines(env.DB, weekKey)
+    weekPlanForResponse(env.DB, weekKey)
   ]);
-  const auto = computeAutoScore({ weekKey, tasks: data.tasks, bonusItems: data.bonusItems, prevRates: rates, deadlines });
+  const auto = computeAutoScore({ weekKey, tasks: data.tasks, bonusItems: data.bonusItems, prevRates: rates, deadlines: plan.deadlines });
   const confirmed = data.tasks.filter((task) => task.status === "confirmed").length;
   return {
     weekKey,
-    label: scheduleLabel(weekKey, schedule),
+    label: scheduleLabel(weekKey, { rangeStart: plan.rangeStart, rangeEnd: plan.rangeEnd }),
     isCurrent: weekKey === weekKeyOf(),
-    hint: scheduleHint(deadlines),
-    schedule: {
-      ...(schedule || {}),
-      deadlines: {
-        fridayChecklist: deadlines.fridayChecklist,
-        saturdayEarly: deadlines.saturdayEarly,
-        saturdayMid: deadlines.saturdayMid,
-        saturdayHard: deadlines.saturdayHard,
-        weekEnd: deadlines.weekEnd
-      },
-      custom: Boolean(schedule && (schedule.rangeStart || Object.keys(SCHEDULE_COLUMNS).some((key) => schedule[key])))
-    },
+    hint: scheduleHint(plan.deadlines),
+    schedule: schedulePayload(plan),
     rate,
     scoreKeys: SCORE_KEYS.map((key) => ({ key, label: SCORE_LABEL[key], max: SCORE_MAX[key] })),
     tasks: data.tasks.map(mapTask),
@@ -567,7 +621,8 @@ route("POST", /^\/api\/settle$/, "parent", async ({ env, user, request }) => {
   const weekKey = canonicalWeekKey(body.weekKey) || weekKeyOf();
   const data = await loadWeek(env, weekKey);
   const rates = await previousRates(env.DB, weekKey);
-  const auto = computeAutoScore({ weekKey, tasks: data.tasks, bonusItems: data.bonusItems, prevRates: rates });
+  const plan = await weekPlanForResponse(env.DB, weekKey);
+  const auto = computeAutoScore({ weekKey, tasks: data.tasks, bonusItems: data.bonusItems, prevRates: rates, deadlines: plan.deadlines });
   const detail = normalizeDetail(body.detail, auto);
   detail.auto = auto.auto;
   const total = totalOf(detail);
@@ -605,22 +660,12 @@ route("PUT", /^\/api\/rate$/, "parent", async ({ env, request }) => {
 
 route("GET", /^\/api\/schedule$/, "student", async ({ env, url }) => {
   const weekKey = pickWeek(url);
-  const [schedule, deadlines] = await Promise.all([loadSchedule(env.DB, weekKey), resolveDeadlines(env.DB, weekKey)]);
+  const plan = await weekPlanForResponse(env.DB, weekKey);
   return json({
     weekKey,
-    label: scheduleLabel(weekKey, schedule),
-    hint: scheduleHint(deadlines),
-    schedule: {
-      ...(schedule || {}),
-      deadlines: {
-        fridayChecklist: deadlines.fridayChecklist,
-        saturdayEarly: deadlines.saturdayEarly,
-        saturdayMid: deadlines.saturdayMid,
-        saturdayHard: deadlines.saturdayHard,
-        weekEnd: deadlines.weekEnd
-      },
-      custom: Boolean(schedule && (schedule.rangeStart || Object.keys(SCHEDULE_COLUMNS).some((key) => schedule[key])))
-    }
+    label: scheduleLabel(weekKey, { rangeStart: plan.rangeStart, rangeEnd: plan.rangeEnd }),
+    hint: scheduleHint(plan.deadlines),
+    schedule: schedulePayload(plan)
   });
 });
 
@@ -675,8 +720,14 @@ route("PUT", /^\/api\/schedule$/, "parent", async ({ env, user, request }) => {
   const hasCustom = Boolean(rangeStart || note || checklist.value !== null || early.value !== null || mid.value !== null || hard.value !== null || weekEndOverride.value !== null);
   if (!hasCustom) {
     await env.DB.prepare("DELETE FROM week_schedules WHERE week_key = ?").bind(weekKey).run();
-    const deadlines = await resolveDeadlines(env.DB, weekKey);
-    return json({ ok: true, weekKey, label: scheduleLabel(weekKey, null), hint: scheduleHint(deadlines), schedule: null });
+    const plan = await weekPlanForResponse(env.DB, weekKey);
+    return json({
+      ok: true,
+      weekKey,
+      label: scheduleLabel(weekKey, { rangeStart: plan.rangeStart, rangeEnd: plan.rangeEnd }),
+      hint: scheduleHint(plan.deadlines),
+      schedule: schedulePayload(plan)
+    });
   }
 
   await env.DB.prepare(
@@ -708,24 +759,13 @@ route("PUT", /^\/api\/schedule$/, "parent", async ({ env, user, request }) => {
       nowIso()
     )
     .run();
-  const schedule = await loadSchedule(env.DB, weekKey);
-  const deadlines = await resolveDeadlines(env.DB, weekKey);
+  const plan = await weekPlanForResponse(env.DB, weekKey);
   return json({
     ok: true,
     weekKey,
-    label: scheduleLabel(weekKey, schedule),
-    hint: scheduleHint(deadlines),
-    schedule: {
-      ...(schedule || {}),
-      deadlines: {
-        fridayChecklist: deadlines.fridayChecklist,
-        saturdayEarly: deadlines.saturdayEarly,
-        saturdayMid: deadlines.saturdayMid,
-        saturdayHard: deadlines.saturdayHard,
-        weekEnd: deadlines.weekEnd
-      },
-      custom: true
-    }
+    label: scheduleLabel(weekKey, { rangeStart: plan.rangeStart, rangeEnd: plan.rangeEnd }),
+    hint: scheduleHint(plan.deadlines),
+    schedule: schedulePayload(plan)
   });
 });
 

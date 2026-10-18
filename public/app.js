@@ -196,6 +196,27 @@ function weekDeadlinesClient(weekKey) {
   };
 }
 
+// 跟服务端 worker/holidays.js 的推导保持一致的假期时间：提前分三档挪到假期最后一天，收工截止是最后一天 24:00。
+function deriveFromRangeClient(weekKey, rangeStart, rangeEnd) {
+  const weekStart = Date.parse(`${weekKey}T00:00:00+08:00`);
+  const start = Date.parse(`${rangeStart}T00:00:00+08:00`);
+  const end = Date.parse(`${rangeEnd}T00:00:00+08:00`);
+  if (!Number.isFinite(weekStart) || !Number.isFinite(start) || !Number.isFinite(end) || end < start || end < weekStart) return null;
+  return {
+    fridayChecklist: Math.min(weekStart + 21 * 3600000, end + 15 * 3600000),
+    saturdayEarly: end + 15 * 3600000,
+    saturdayMid: end + 18 * 3600000,
+    saturdayHard: end + 21 * 3600000,
+    weekEnd: end + 86400000
+  };
+}
+
+function msFromLocalInput(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return NaN;
+  return Date.parse(`${raw.slice(0, 16)}:00+08:00`);
+}
+
 function deadlineHint(week = state.week) {
   if (!week) return "";
   const deadlines = deadlinesOf(week);
@@ -628,31 +649,32 @@ function renderRewards() {
 function renderSchedule() {
   const schedule = state.week.schedule || {};
   const deadlines = deadlinesOf();
-  const isCustom = Boolean(schedule.custom);
+  const holiday = schedule.source === "auto" ? schedule.holiday : null;
   return `
     <div class="card">
       <div class="row between">
         <strong>本周时间设置</strong>
         <button class="tiny" data-act="schedule-toggle">${state.scheduleOpen ? "收起" : "修改"}</button>
       </div>
+      ${holiday ? `<div class="small" style="margin-top:6px">按${esc(holiday.name)}（${esc(holiday.start)} ~ ${esc(holiday.end)}）自动排的时间，可以直接改，改完保存就按你填的算。</div>` : ""}
       <div class="small muted" style="margin-top:6px">${esc(deadlineHint())}</div>
-      ${isCustom && schedule.note ? `<div class="small" style="margin-top:4px">备注：${esc(schedule.note)}</div>` : ""}
+      ${schedule.note ? `<div class="small" style="margin-top:4px">备注：${esc(schedule.note)}</div>` : ""}
       ${state.scheduleOpen ? `
         <form class="editor" data-form="schedule">
-          <div class="small muted" style="margin-bottom:8px">放假不一定在周五到周日，这里可以按实际假期改清单截止、提前分三档和收工截止；留空表示用默认值（清单周五 21:00、提前分周六 15:00/18:00/21:00、收工周日 24:00）。</div>
+          <div class="small muted" style="margin-bottom:8px">放假不一定在周五到周日。填了放假起止日期，提前分三档按假期最后一天 15:00 / 18:00 / 21:00、收工截止按最后一天 24:00 算；不填就走默认（清单周五 21:00、提前分周六 15:00 / 18:00 / 21:00、收工周日 24:00）。</div>
           <div class="grid2">
             <label class="field"><span>放假开始日期（可选）</span><input name="rangeStart" type="date" value="${esc(schedule.rangeStart || "")}" /></label>
             <label class="field"><span>放假结束日期（可选）</span><input name="rangeEnd" type="date" value="${esc(schedule.rangeEnd || "")}" /></label>
           </div>
-          <label class="field"><span>清单截止（留空 = 默认周五 21:00）</span><input name="fridayChecklist" type="datetime-local" value="${schedule.custom ? toLocalInput(schedule.fridayChecklist) : ""}" /><span class="small muted">当前生效：${fmtDay(deadlines.fridayChecklist)}</span></label>
-          <label class="field"><span>提前分：满分档（默认周六 15:00）</span><input name="saturdayEarly" type="datetime-local" value="${schedule.custom ? toLocalInput(schedule.saturdayEarly) : ""}" /><span class="small muted">当前生效：${fmtDay(deadlines.saturdayEarly)}</span></label>
-          <label class="field"><span>提前分：+8 档（默认周六 18:00）</span><input name="saturdayMid" type="datetime-local" value="${schedule.custom ? toLocalInput(schedule.saturdayMid) : ""}" /><span class="small muted">当前生效：${fmtDay(deadlines.saturdayMid)}</span></label>
-          <label class="field"><span>提前分：+5 档 / 收工（默认周六 21:00）</span><input name="saturdayHard" type="datetime-local" value="${schedule.custom ? toLocalInput(schedule.saturdayHard) : ""}" /><span class="small muted">当前生效：${fmtDay(deadlines.saturdayHard)}</span></label>
-          <label class="field"><span>收工截止（默认周日 24:00）</span><input name="weekEnd" type="datetime-local" value="${schedule.custom ? toLocalInput(schedule.weekEnd) : ""}" /><span class="small muted">当前生效：${fmtDay(deadlines.weekEnd)}</span></label>
+          <label class="field"><span>清单截止</span><input name="fridayChecklist" type="datetime-local" value="${toLocalInput(deadlines.fridayChecklist)}" /></label>
+          <label class="field"><span>提前分：满分档</span><input name="saturdayEarly" type="datetime-local" value="${toLocalInput(deadlines.saturdayEarly)}" /></label>
+          <label class="field"><span>提前分：+8 档</span><input name="saturdayMid" type="datetime-local" value="${toLocalInput(deadlines.saturdayMid)}" /></label>
+          <label class="field"><span>提前分：+5 档 / 收工</span><input name="saturdayHard" type="datetime-local" value="${toLocalInput(deadlines.saturdayHard)}" /></label>
+          <label class="field"><span>收工截止</span><input name="weekEnd" type="datetime-local" value="${toLocalInput(deadlines.weekEnd)}" /></label>
           <label class="field"><span>备注（可选）</span><input name="note" maxlength="60" value="${esc(schedule.note || "")}" placeholder="例如：国庆放假 10-01 到 10-08" /></label>
           <div class="actions">
             <button class="primary" type="submit">保存时间</button>
-            <button type="button" class="ghost" data-act="schedule-default">恢复默认周五到周日</button>
+            <button type="button" class="ghost" data-act="schedule-default">清空手动设置</button>
           </div>
         </form>` : ""}
     </div>`;
@@ -906,6 +928,23 @@ document.addEventListener("keydown", (event) => {
   target.click();
 });
 
+// 改了放假起止日期，就把还没动过的时间框刷成新区间对应的时间
+document.addEventListener("change", (event) => {
+  const target = event.target;
+  if (!target || (target.name !== "rangeStart" && target.name !== "rangeEnd")) return;
+  const form = target.closest("form[data-form=schedule]");
+  if (!form) return;
+  const rangeStart = form.elements.namedItem("rangeStart").value;
+  const rangeEnd = form.elements.namedItem("rangeEnd").value;
+  const derived = (rangeStart && rangeEnd ? deriveFromRangeClient(state.weekKey, rangeStart, rangeEnd) : null) || weekDeadlinesClient(state.weekKey);
+  const previous = deadlinesOf();
+  for (const key of ["fridayChecklist", "saturdayEarly", "saturdayMid", "saturdayHard", "weekEnd"]) {
+    const input = form.elements.namedItem(key);
+    const current = msFromLocalInput(input.value);
+    if (!Number.isFinite(current) || current === Number(previous[key])) input.value = toLocalInput(derived[key]);
+  }
+});
+
 document.addEventListener("submit", (event) => {
   const form = event.target.closest("form[data-form]");
   if (!form) return;
@@ -975,13 +1014,24 @@ document.addEventListener("submit", (event) => {
 
   if (name === "schedule") {
     run(async () => {
-      const payload = { weekKey: state.weekKey };
+      const schedule = state.week.schedule || {};
+      const rangeStart = data.rangeStart || null;
+      const rangeEnd = data.rangeEnd || null;
+      const holiday = schedule.source === "auto" ? schedule.holiday : null;
+      const keepAutoRange = Boolean(holiday && rangeStart === holiday.start && rangeEnd === holiday.end);
+      // 只提交跟“按放假区间推算 / 默认时间”不一样的值，剩下的交给服务端自动算，免得把自动时间固化下来。
+      const derived = (rangeStart && rangeEnd ? deriveFromRangeClient(state.weekKey, rangeStart, rangeEnd) : null) || weekDeadlinesClient(state.weekKey);
+      const payload = {
+        weekKey: state.weekKey,
+        rangeStart: keepAutoRange ? null : rangeStart,
+        rangeEnd: keepAutoRange ? null : rangeEnd,
+        note: data.note || null
+      };
       for (const key of ["fridayChecklist", "saturdayEarly", "saturdayMid", "saturdayHard", "weekEnd"]) {
-        payload[key] = data[key] ? fromLocalInput(data[key]) : null;
+        const value = data[key] ? fromLocalInput(data[key]) : null;
+        const ms = value ? Date.parse(value) : NaN;
+        payload[key] = Number.isFinite(ms) && ms !== Number(derived[key]) ? value : null;
       }
-      payload.rangeStart = data.rangeStart || null;
-      payload.rangeEnd = data.rangeEnd || null;
-      payload.note = data.note || null;
       await api("/api/schedule", { method: "PUT", body: payload });
       await loadWeek();
       state.scheduleOpen = false;
@@ -1125,7 +1175,8 @@ document.addEventListener("click", (event) => {
       for (const key of ["fridayChecklist", "saturdayEarly", "saturdayMid", "saturdayHard", "weekEnd", "rangeStart", "rangeEnd", "note"]) {
         form.elements.namedItem(key).value = "";
       }
-      setNotice("表单已清空为默认值，点「保存时间」生效");
+      const auto = state.week?.schedule?.source === "auto";
+      setNotice(auto ? "已清空，保存后回到节假日自动时间" : "已清空，保存后回到默认周五到周日");
     },
     "toggle-add": () => {
       state.addTask = !state.addTask;

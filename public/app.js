@@ -399,7 +399,7 @@ function render() {
   view.innerHTML = `
     <header class="appbar">
       <div class="appbar-row">
-        <h1>周末作业打卡</h1>
+        <h1><img class="brand" src="/logo.svg" alt="" width="30" height="30" />周末作业打卡</h1>
         <div class="who">
           ${esc(state.user.displayName)} · ${ROLE_TEXT[state.user.role]}<br />
           <button class="link small" data-act="refresh">刷新</button>
@@ -877,7 +877,7 @@ function renderLogin() {
   view.innerHTML = `
     <div class="login">
       <div class="card">
-        <h1>周末作业打卡</h1>
+        <h1><img class="brand" src="/logo.svg" alt="" width="34" height="34" />周末作业打卡</h1>
         <div class="small muted" style="margin-bottom:14px">学生点完成，家长确认，周末结算积分。</div>
         ${state.error ? `<div class="notice error">${esc(state.error)}</div>` : ""}
         <form data-form="login">
